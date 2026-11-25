@@ -34,6 +34,7 @@ bookkeeping. It is made for one person on one machine.
 |---|---|
 | `corral version` | works |
 | `corral netns`, the network fence for one agent | works, on its own too; needs root through sudo |
+| `corral approvald`, the gate for a nono sandbox's permission requests | works, on its own |
 | `corral run` and the client commands | not yet |
 
 ## Setup
@@ -56,7 +57,8 @@ Run the tests with `go test ./...`.
 corral version
 ```
 
-The supervisor is not finished, but the network fence can be used on its own.
+The supervisor is not finished, but the network fence and the gate for nono
+can be used on their own.
 
 ### `corral netns`: a network fence for one agent
 
@@ -132,6 +134,41 @@ names, passes no IPv6 (off on this machine's end of each pair, and dropped by
 the rules), changes no system setting, keeps nothing across a reboot, and
 refuses to run inside any network namespace but the machine's own.
 
+### `corral approvald`: answers a nono sandbox's permission requests
+
+`corral approvald` answers the run-time permission requests of a
+[nono](https://nono.sh) sandbox from a scope file such as
+`examples/scope.toml`. It grants the folders listed in `paths`. It denies
+every network request and logs it, because nono does not yet send the
+addresses a host resolved to; `targets` take effect once it does.
+
+Put its socket in a folder that only you can write and the sandboxed program
+cannot, not below `/run` or `/tmp`, and keep the path under 108 bytes:
+
+```sh
+mkdir -p -m 700 ~/.local/state/corral
+corral approvald --socket ~/.local/state/corral/approval.sock --scope scope.toml
+```
+
+Then point your nono profile at it:
+
+```json
+{
+  "extends": "default",
+  "linux": { "af_unix_mediation": "pathname" },
+  "security": {
+    "capability_elevation": true,
+    "approval_backends": {
+      "corral": { "type": "webhook", "url": "unix:///home/you/.local/state/corral/approval.sock", "timeout_secs": 30 }
+    },
+    "approval_defaults": { "backend": "corral" }
+  }
+}
+```
+
+It prints one JSON line per answer it sent and per request it refused itself
+(malformed, too large, too slow), and stops on Ctrl-C.
+
 ## Configuration
 
 The supervisor (`corral run`, not finished yet) reads two TOML files;
@@ -162,7 +199,8 @@ tool, each behind a small interface in the package `integration`:
 A tool is added by a Go package that implements one of the interfaces and
 registers itself under a name; the configuration then picks it by that name.
 
-A runtime for the coding agent pi is built in and registered as `pi`.
+Built in: a sandbox and a key proxy for [nono](https://nono.sh), registered
+as `nono`, and a runtime for the coding agent pi, registered as `pi`.
 
 ## License
 

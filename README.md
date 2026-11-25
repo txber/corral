@@ -226,39 +226,39 @@ sends it as `Authorization: Bearer <key>`; the agent reaches the gateway at
 `https://gateway.example/v1`, write `GET /models` for `/v1/models`. Other
 endpoints get 403.
 
-**Roles.** nono reads `memory` (such as `"2G"`), `max_processes` (0 means no
-limit) and `network`:
+**Roles.** Once `corral run` is finished, nono will take `memory` (such as
+`"2G"`), `max_processes` (0 means no limit) and `network` from a role:
 
 - `"none"`: nono's own network lock stays on and it serves the gateway inside
   the sandbox; other hosts go to the approval socket, raw UDP and direct TCP
   are refused. No key proxy is used.
-- `"direct"`: the agent runs in its own namespace
-  ([`corral netns`](#corral-netns-a-network-fence-for-one-agent)); nono
-  confines files and processes, and `nono proxy` serves the gateway.
+- `"direct"`: the agent is to run in its own namespace
+  ([`corral netns`](#corral-netns-a-network-fence-for-one-agent)), nono
+  confining files and processes and `nono proxy` serving the gateway.
 - `"proxy"` is refused.
 
 **The system must offer:**
 
-- Landlock ABI 4 or newer, as tested (nono needs it for per-port TCP rules);
-  `nono setup --check-only` reports it.
+- Landlock, as `nono setup --check-only` reports it; corral is tested on a
+  kernel with Landlock ABI 10, where nono 0.82.0 enforces ABI 6.
 - For `memory` and `max_processes`: `cpu`, `memory` and `pids` delegated to
   your systemd user manager (see
   `/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers`),
   and nono started inside it, for example under
   `systemd-run --user --wait --pipe --collect`; a login shell is not enough.
   For `"direct"` this also needs `!pam_session` in the sudoers entry.
-- A short `paths.state`: each agent's approval socket in it must fit in
-  107 bytes.
 
-**Limits today.** nono 0.82.0 asks about a host before resolving it, so every
-network request is denied (`no resolved addresses for host`) and `targets`
-have no effect yet. Ordinary programs ask for files outside their grants
-(curl reads `/proc/sys/crypto/fips_enabled`), so expect such denials in the
-log.
+**Limits today.** No corral command starts the nono sandbox or key proxy
+yet: `corral run` is not finished. Today nono works with corral only through
+`corral approvald` (below). nono 0.82.0 asks about a host before resolving
+it, so every network request is denied (`no resolved addresses for host`)
+and `targets` have no effect yet. Ordinary programs ask for files outside
+their grants (curl reads `/proc/sys/crypto/fips_enabled`), so expect such
+denials in the log.
 
-**`corral approvald` with nono on its own.** Point the profile at the socket.
-approvald answers 2 seconds before `timeout_secs` runs out, with a denial if
-no decision was made:
+**`corral approvald` with nono on its own.** Point a profile at the socket,
+with your home folder in place of `/home/you`. approvald answers 2 seconds
+before `timeout_secs` runs out, with a denial if no decision was made:
 
 ```json
 {
@@ -274,9 +274,20 @@ no decision was made:
 }
 ```
 
-This sends file requests only. For host requests, also set
-`network.approval_backends` and `network.approval_defaults` in the same
-shape; that turns on nono's proxy and rules out `--block-net`.
+Save it, for example as `~/.config/nono/corral.json`, and start the program
+with a working folder that does not hold the socket:
+
+```sh
+/opt/nono/bin/nono run --profile ~/.config/nono/corral.json --block-net \
+  --allow <workdir> -- <command> [<arg>...]
+```
+
+This sends file requests to approvald and blocks the network. Without
+`--block-net` the network is open, as in nono's default profile, and no host
+is asked about. To send host requests to approvald instead, drop
+`--block-net` and also set `network.approval_backends` and
+`network.approval_defaults` in the same shape; with nono 0.82.0 every host is
+then denied (see Limits today).
 
 ### pi: runtime
 
@@ -285,11 +296,16 @@ in its RPC mode. It is registered as `pi` for `[runtime]`.
 
 **Install.** corral is tested with pi 1.6.0, the archive
 `pi-linux-x64.tar.gz` of
-[its release](https://github.com/earendil-works/pi/releases/tag/v1.6.0). pi
-loads assets from next to its executable, so keep the unpacked folder
-together, for example as `/usr/local/lib/pi/`. Set `binary` to the
-executable in it, not to a link elsewhere: the agent may read the folder
-that holds `binary`.
+[its release](https://github.com/earendil-works/pi/releases/tag/v1.6.0)
+(check it against `SHA256SUMS`). pi loads assets from next to its
+executable, so keep the unpacked folder `pi/` together, root-owned:
+
+```sh
+sudo tar -xzf pi-linux-x64.tar.gz --no-same-owner -C /usr/local/lib   # gives /usr/local/lib/pi/pi
+```
+
+Set `binary` to the executable in it, not to a link elsewhere: the agent may
+read the folder that holds `binary`.
 
 **Configure.** The gateway must speak the OpenAI chat-completions API, for
 example with the endpoints `POST /chat/completions` and `GET /models`.

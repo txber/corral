@@ -3,6 +3,7 @@ package nono
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -150,7 +151,7 @@ func TestWrapPutsTheCommandAfterADoubleDash(t *testing.T) {
 	argv := newSandbox(t).Wrap(a, command)
 	want := []string{
 		binary, "run", "--silent", "--sandbox-policy=external",
-		"--name=a1",
+		"--name=corral-a1",
 		"--profile=" + filepath.Join(a.StateDir, "sandbox.json"),
 		"--allow=/home/you/work/a1",
 		"--memory=2G",
@@ -186,7 +187,7 @@ func TestWrapLeavesOutLimitsThatAreUnset(t *testing.T) {
 
 func TestStopCommandNamesTheSession(t *testing.T) {
 	got := newSandbox(t).StopCommand(sampleAgent(t, "direct"))
-	if want := []string{binary, "stop", "a1"}; !slices.Equal(got, want) {
+	if want := []string{binary, "stop", "--timeout=3", "corral-a1"}; !slices.Equal(got, want) {
 		t.Errorf("StopCommand = %q, want %q", got, want)
 	}
 }
@@ -481,5 +482,42 @@ func TestSandboxProfileRefusesASocketPathTooLongToBind(t *testing.T) {
 	a.StateDir = "/" + strings.Repeat("d", 100)
 	if err := newSandbox(t).Prepare(a, nil); err == nil || !strings.Contains(err.Error(), "longer than 107 bytes") {
 		t.Errorf("Prepare = %v, want an error about the socket path's length", err)
+	}
+}
+
+// hexOnly reports whether text could be the start of a session id, which
+// nono stop also accepts: lower-case hex digits only.
+func hexOnly(text string) bool {
+	return strings.Trim(text, "0123456789abcdef") == ""
+}
+
+func TestStopArgumentCanNeverMatchASessionID(t *testing.T) {
+	s := newSandbox(t)
+	stopArg := func(id string) string {
+		a := sampleAgent(t, "direct")
+		a.ID = id
+		stop := s.StopCommand(a)
+		return stop[len(stop)-1]
+	}
+	// Agent ids made only of hex digits are the dangerous ones.
+	for _, id := range []string{"a1", "b2", "f3", "e10", "abcdef012345", "z9"} {
+		if arg := stopArg(id); hexOnly(arg) {
+			t.Errorf("agent %q: stop argument %q could match a session id", id, arg)
+		}
+	}
+	// Every valid id: a letter, then up to eleven letters or digits.
+	const letters, rest = "abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz0123456789"
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 2000 {
+		id := []byte{letters[rng.IntN(len(letters))]}
+		for range rng.IntN(12) {
+			id = append(id, rest[rng.IntN(len(rest))])
+		}
+		if !agentID.Match(id) {
+			t.Fatalf("generated id %q is not valid", id)
+		}
+		if arg := stopArg(string(id)); hexOnly(arg) || arg != "corral-"+string(id) {
+			t.Errorf("agent %q: stop argument %q", id, arg)
+		}
 	}
 }

@@ -70,6 +70,13 @@ const maxSocketPath = 107
 // read as an option.
 var agentID = regexp.MustCompile(`^[a-z][a-z0-9]{0,11}$`)
 
+// sessionName is the name of an agent's nono session. nono stop takes a
+// session's exact name or the start of its random hex id; the prefix holds
+// letters that are not hex digits, so the name can only ever stop this
+// agent's session, never another one whose id happens to start with the
+// agent id.
+func sessionName(a integration.Agent) string { return "corral-" + a.ID }
+
 // backendName is the name the profiles give the approval endpoint.
 const backendName = "corral"
 
@@ -283,7 +290,7 @@ func (s sandbox) Wrap(a integration.Agent, command []string) []string {
 		argv = append(argv, "--block-net")
 	}
 	argv = append(argv,
-		"--name="+a.ID,
+		"--name="+sessionName(a),
 		"--profile="+filepath.Join(a.StateDir, sandboxProfileFile),
 		"--allow="+a.Workdir,
 	)
@@ -310,11 +317,12 @@ func (s sandbox) Approvals(a integration.Agent, decide func(integration.Request)
 	return srv.Close, nil
 }
 
-// StopCommand ends the agent's sandbox session by its name. nono stop
-// names no end-of-options marker; Prepare refuses an id that does not
-// start with a letter, so the id cannot be read as an option.
+// StopCommand ends the agent's sandbox session by its name (see
+// sessionName), which starts with a letter and so cannot be read as an
+// option. The supervisor allows the stop command 5 s; a grace of 3 s keeps
+// nono's own escalation to SIGKILL inside that.
 func (s sandbox) StopCommand(a integration.Agent) []string {
-	return []string{s.binary, "stop", a.ID}
+	return []string{s.binary, "stop", "--timeout=3", sessionName(a)}
 }
 
 // AuditPath is empty: nono keeps a session's audit record in a folder

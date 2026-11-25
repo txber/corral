@@ -261,8 +261,8 @@ func FuzzProfile(f *testing.F) {
 			}
 		} else {
 			checkPrepared(t, a, readPaths, file)
-			if stop := s.StopCommand(a); slices.ContainsFunc(stop[2:], func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
-				t.Errorf("StopCommand %q has an option after stop", stop)
+			if stop := s.StopCommand(a); !slices.Equal(stop, []string{binary, "stop", "--timeout=3", "corral-" + id}) {
+				t.Errorf("StopCommand = %q, want the session named corral-%s", stop, id)
 			}
 		}
 
@@ -296,7 +296,7 @@ func FuzzProfile(f *testing.F) {
 				t.Errorf("%q before -- is not an option", option)
 			}
 		}
-		for _, want := range []string{"--name=" + id, "--allow=" + workdir} {
+		for _, want := range []string{"--name=corral-" + id, "--allow=" + workdir} {
 			if !slices.Contains(options, want) {
 				t.Errorf("Wrap = %q, want %q", argv, want)
 			}

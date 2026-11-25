@@ -7,9 +7,12 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -63,76 +66,113 @@ type rawConfig struct {
 	KeyProxy map[string]any `toml:"key_proxy"`
 }
 
-var gatewayName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+var (
+	gatewayName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	httpMethod  = regexp.MustCompile(`^[A-Z]+$`)
+	roleName    = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+)
 
 // Load reads and checks corral.toml. A leading ~ in a path is the home folder.
 func Load(path string) (Config, error) {
 	var raw rawConfig
-	if err := decodeStrict(path, &raw); err != nil {
+	err := decodeStrict(path, &raw, func(parent toml.Key) []string {
+		switch parent.String() {
+		case "":
+			return []string{"max_agents", "gateway", "paths", "sandbox", "runtime", "key_proxy"}
+		case "gateway":
+			return []string{"name", "upstream", "endpoints", "key_file"}
+		case "paths":
+			return []string{"state", "run", "work", "roles", "helper"}
+		}
+		return nil // the options of an integration are not ours to check
+	})
+	if err != nil {
 		return Config{}, err
 	}
-	var cfg Config
-	var err error
 
 	if raw.MaxAgents < 1 || raw.MaxAgents > 250 {
 		return Config{}, fmt.Errorf("%s: max_agents is %d, want 1 to 250", path, raw.MaxAgents)
 	}
-	cfg.MaxAgents = raw.MaxAgents
 
 	g := raw.Gateway
 	if !gatewayName.MatchString(g.Name) {
 		return Config{}, fmt.Errorf("%s: gateway.name %q must match %s", path, g.Name, gatewayName)
 	}
-	if u, err := url.Parse(g.Upstream); err != nil || u.Scheme != "https" || u.Host == "" {
-		return Config{}, fmt.Errorf("%s: gateway.upstream %q must be an https:// address", path, g.Upstream)
+	// The upstream is written into files and logs, so it must carry no
+	// credentials; the key comes from key_file.
+	u, err := url.Parse(g.Upstream)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || strings.ContainsAny(g.Upstream, "?#") {
+		return Config{}, fmt.Errorf("%s: gateway.upstream %q must be an https:// address with a host and no user, query or fragment", path, g.Upstream)
 	}
-	cfg.Gateway = integration.Gateway{Name: g.Name, Upstream: g.Upstream}
+	if len(g.Endpoints) == 0 {
+		return Config{}, fmt.Errorf("%s: gateway.endpoints is empty", path)
+	}
+	var endpoints []integration.Endpoint
 	for _, e := range g.Endpoints {
 		method, p, ok := strings.Cut(e, " ")
-		if !ok || method == "" || method != strings.ToUpper(method) || !strings.HasPrefix(p, "/") || strings.ContainsAny(p, " \t") {
+		if !ok || !httpMethod.MatchString(method) || !strings.HasPrefix(p, "/") || strings.Contains(p, " ") {
 			return Config{}, fmt.Errorf("%s: gateway.endpoints entry %q must be <METHOD> <path>", path, e)
 		}
-		cfg.Gateway.Endpoints = append(cfg.Gateway.Endpoints, integration.Endpoint{Method: method, Path: p})
+		endpoints = append(endpoints, integration.Endpoint{Method: method, Path: p})
 	}
-	if cfg.Gateway.KeyFile, err = absolutePath(path, "gateway.key_file", g.KeyFile, true); err != nil {
+	keyFile, err := absolutePath(path, "gateway.key_file", g.KeyFile, true)
+	if err != nil {
 		return Config{}, err
 	}
 
-	p := raw.Paths
-	for _, f := range []struct {
-		key      string
-		in       string
-		out      *string
-		required bool
-	}{
-		{"paths.state", p.State, &cfg.Paths.State, true},
-		{"paths.run", p.Run, &cfg.Paths.Run, true},
-		{"paths.work", p.Work, &cfg.Paths.Work, true},
-		{"paths.roles", p.Roles, &cfg.Paths.Roles, true},
-		{"paths.helper", p.Helper, &cfg.Paths.Helper, false},
-	} {
-		if *f.out, err = absolutePath(path, f.key, f.in, f.required); err != nil {
-			return Config{}, err
-		}
+	state, err := absolutePath(path, "paths.state", raw.Paths.State, true)
+	if err != nil {
+		return Config{}, err
+	}
+	run, err := absolutePath(path, "paths.run", raw.Paths.Run, true)
+	if err != nil {
+		return Config{}, err
+	}
+	work, err := absolutePath(path, "paths.work", raw.Paths.Work, true)
+	if err != nil {
+		return Config{}, err
+	}
+	roles, err := absolutePath(path, "paths.roles", raw.Paths.Roles, true)
+	if err != nil {
+		return Config{}, err
+	}
+	helper, err := absolutePath(path, "paths.helper", raw.Paths.Helper, false)
+	if err != nil {
+		return Config{}, err
 	}
 
-	for _, u := range []struct {
-		key string
-		in  map[string]any
-		out *Use
-	}{
-		{"sandbox", raw.Sandbox, &cfg.Sandbox},
-		{"runtime", raw.Runtime, &cfg.Runtime},
-		{"key_proxy", raw.KeyProxy, &cfg.KeyProxy},
-	} {
-		name, ok := u.in["use"].(string)
-		if !ok || name == "" {
-			return Config{}, fmt.Errorf("%s: %s.use is missing or not a name", path, u.key)
-		}
-		delete(u.in, "use")
-		*u.out = Use{Name: name, Options: u.in}
+	sandbox, err := useOf(path, "sandbox", raw.Sandbox)
+	if err != nil {
+		return Config{}, err
 	}
-	return cfg, nil
+	runtime, err := useOf(path, "runtime", raw.Runtime)
+	if err != nil {
+		return Config{}, err
+	}
+	keyProxy, err := useOf(path, "key_proxy", raw.KeyProxy)
+	if err != nil {
+		return Config{}, err
+	}
+
+	return Config{
+		Gateway:   integration.Gateway{Name: g.Name, Upstream: g.Upstream, Endpoints: endpoints, KeyFile: keyFile},
+		Paths:     Paths{State: state, Run: run, Work: work, Roles: roles, Helper: helper},
+		MaxAgents: raw.MaxAgents,
+		Sandbox:   sandbox,
+		Runtime:   runtime,
+		KeyProxy:  keyProxy,
+	}, nil
+}
+
+// useOf turns the table called key into a Use: its `use` entry is the name
+// and every other entry is an option.
+func useOf(file, key string, table map[string]any) (Use, error) {
+	name, ok := table["use"].(string)
+	if !ok || name == "" {
+		return Use{}, fmt.Errorf("%s: %s.use is missing or not a name", file, key)
+	}
+	delete(table, "use")
+	return Use{Name: name, Options: table}, nil
 }
 
 // rawRole mirrors one role table. The cost numbers are pointers so that a
@@ -151,11 +191,27 @@ type rawRole struct {
 // LoadRoles reads and checks roles.toml.
 func LoadRoles(path string) (map[string]Role, error) {
 	var raw map[string]rawRole
-	if err := decodeStrict(path, &raw); err != nil {
+	err := decodeStrict(path, &raw, func(parent toml.Key) []string {
+		switch {
+		case len(parent) == 1: // inside a role
+			return []string{"network", "model", "memory", "max_processes", "cost", "options"}
+		case len(parent) == 2 && parent[1] == "cost":
+			return []string{"input", "output", "cacheRead", "cacheWrite"}
+		}
+		return nil // role names are checked below; options are the runtime's
+	})
+	if err != nil {
 		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%s: no role is defined", path)
 	}
 	roles := make(map[string]Role, len(raw))
 	for name, r := range raw {
+		// Agent ids are derived from the role name, so it must be plain.
+		if !roleName.MatchString(name) {
+			return nil, fmt.Errorf("%s: role %q must match %s", path, name, roleName)
+		}
 		switch r.Network {
 		case "direct", "proxy", "none":
 		default:
@@ -170,46 +226,59 @@ func LoadRoles(path string) (map[string]Role, error) {
 		if r.Cost == nil {
 			return nil, fmt.Errorf("%s: %s.cost is missing", path, name)
 		}
-		var cost integration.Cost
-		for _, n := range []struct {
-			key string
-			in  *float64
-			out *float64
-		}{
-			{"input", r.Cost.Input, &cost.Input},
-			{"output", r.Cost.Output, &cost.Output},
-			{"cacheRead", r.Cost.CacheRead, &cost.CacheRead},
-			{"cacheWrite", r.Cost.CacheWrite, &cost.CacheWrite},
-		} {
-			if n.in == nil {
-				return nil, fmt.Errorf("%s: %s.cost.%s is missing", path, name, n.key)
-			}
-			if *n.in < 0 {
-				return nil, fmt.Errorf("%s: %s.cost.%s is negative", path, name, n.key)
-			}
-			*n.out = *n.in
+		input, err := price(path, name, "input", r.Cost.Input)
+		if err != nil {
+			return nil, err
+		}
+		output, err := price(path, name, "output", r.Cost.Output)
+		if err != nil {
+			return nil, err
+		}
+		cacheRead, err := price(path, name, "cacheRead", r.Cost.CacheRead)
+		if err != nil {
+			return nil, err
+		}
+		cacheWrite, err := price(path, name, "cacheWrite", r.Cost.CacheWrite)
+		if err != nil {
+			return nil, err
 		}
 		roles[name] = Role{
 			Name:    name,
 			Network: r.Network,
 			Model:   r.Model,
 			Limits:  integration.Limits{Memory: r.Memory, MaxProcesses: r.MaxProcesses},
-			Cost:    cost,
+			Cost:    integration.Cost{Input: input, Output: output, CacheRead: cacheRead, CacheWrite: cacheWrite},
 			Options: r.Options,
 		}
 	}
 	return roles, nil
 }
 
-// decodeStrict reads the TOML file at path into v and refuses any key that v
-// has no field for.
-func decodeStrict(path string, v any) error {
+// price checks one cost number of a role: it must be set, finite and not negative.
+func price(file, role, key string, v *float64) (float64, error) {
+	if v == nil {
+		return 0, fmt.Errorf("%s: %s.cost.%s is missing", file, role, key)
+	}
+	if math.IsNaN(*v) || math.IsInf(*v, 0) || *v < 0 {
+		return 0, fmt.Errorf("%s: %s.cost.%s is %v, want a finite number of 0 or more", file, role, key, *v)
+	}
+	return *v, nil
+}
+
+// decodeStrict reads the TOML file at path into v and refuses every key that
+// is not spelt exactly as the schema says. The decoder alone would accept
+// KEY_FILE for key_file. allowed returns the exact names permitted inside
+// the table parent, or nil when anything may be there.
+func decodeStrict(path string, v any, allowed func(parent toml.Key) []string) error {
 	md, err := toml.DecodeFile(path, v)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
-	if keys := md.Undecoded(); len(keys) > 0 {
-		return fmt.Errorf("%s: unknown key %s", path, keys[0])
+	for _, key := range md.Keys() {
+		parent, name := key[:len(key)-1], key[len(key)-1]
+		if names := allowed(parent); names != nil && !slices.Contains(names, name) {
+			return fmt.Errorf("%s: unknown key %s", path, key)
+		}
 	}
 	return nil
 }
@@ -233,5 +302,9 @@ func absolutePath(file, key, value string, required bool) (string, error) {
 	if !strings.HasPrefix(value, "/") {
 		return "", fmt.Errorf("%s: %s %q must be an absolute path", file, key, value)
 	}
-	return value, nil
+	// Refuse ".." rather than resolve it, so that a path says where it goes.
+	if slices.Contains(strings.Split(value, "/"), "..") {
+		return "", fmt.Errorf("%s: %s %q must not contain ..", file, key, value)
+	}
+	return path.Clean(value), nil
 }

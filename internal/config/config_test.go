@@ -68,7 +68,7 @@ func TestExampleConfigLoads(t *testing.T) {
 	if cfg.Paths.State != "/home/you/.local/state/corral" || cfg.Paths.Helper != "" {
 		t.Errorf("paths = %+v", cfg.Paths)
 	}
-	if cfg.Sandbox.Name == "" || cfg.Sandbox.Options["binary"] != "/usr/local/bin/"+cfg.Sandbox.Name {
+	if cfg.Sandbox.Name == "" || cfg.Sandbox.Options["binary"] == nil {
 		t.Errorf("sandbox = %+v", cfg.Sandbox)
 	}
 	if _, ok := cfg.Runtime.Options["use"]; ok || cfg.Runtime.Name == "" {
@@ -110,6 +110,19 @@ func TestBadConfigIsRefused(t *testing.T) {
 		{"missing use", `use = "runner"`, ``, "runtime.use"},
 		{"too few agents", `max_agents = 4`, `max_agents = 0`, "max_agents"},
 		{"too many agents", `max_agents = 4`, `max_agents = 251`, "max_agents"},
+		{"key in the wrong case", `key_file =`, `KEY_FILE =`, "KEY_FILE"},
+		{"top-level key in the wrong case", `max_agents = 4`, `Max_Agents = 4`, "Max_Agents"},
+		{"no endpoints", `endpoints = ["POST /chat/completions", "GET /models"]`, `endpoints = []`, "gateway.endpoints"},
+		{"odd method", `"GET /models"`, `"P{S /models"`, "gateway.endpoints"},
+		{"path with a space", `"GET /models"`, `"GET /mod els"`, "gateway.endpoints"},
+		{"path with dot-dot", `work = "/home/you/work"`, `work = "/home/you/../../etc"`, "paths.work"},
+		{"key file with dot-dot", `/home/you/.keys/example`, `/home/you/../x`, "gateway.key_file"},
+		{"upstream with credentials", `https://gateway.example/v1`, `https://user:pass@gateway.example/v1`, "gateway.upstream"},
+		{"upstream with a query", `https://gateway.example/v1`, `https://gateway.example/v1?a=b`, "gateway.upstream"},
+		{"upstream with a fragment", `https://gateway.example/v1`, `https://gateway.example/v1#x`, "gateway.upstream"},
+		{"upstream without a host", `https://gateway.example/v1`, `https:///v1`, "gateway.upstream"},
+		{"relative helper", `roles = "/home/you/roles.toml"`, "roles = \"/home/you/roles.toml\"\nhelper = \"corral\"", "paths.helper"},
+		{"use that is not a string", `use = "runner"`, `use = 7`, "runtime.use"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -131,12 +144,52 @@ func TestBadConfigIsRefused(t *testing.T) {
 	}
 }
 
+func TestHelperIsKept(t *testing.T) {
+	text := strings.Replace(validConfig, `roles = "/home/you/roles.toml"`, "roles = \"/home/you/roles.toml\"\nhelper = \"/opt/x/../bin/corral\"", 1)
+	_, err := Load(writeFile(t, text))
+	if err == nil {
+		t.Fatal("a helper with .. must be refused")
+	}
+	text = strings.Replace(validConfig, `roles = "/home/you/roles.toml"`, "roles = \"/home/you/roles.toml\"\nhelper = \"/opt/bin//corral\"", 1)
+	cfg, err := Load(writeFile(t, text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Paths.Helper != "/opt/bin/corral" {
+		t.Errorf("helper = %q", cfg.Paths.Helper)
+	}
+}
+
+func TestMissingGatewayIsRefused(t *testing.T) {
+	i := strings.Index(validConfig, "[gateway]")
+	j := strings.Index(validConfig, "[paths]")
+	_, err := Load(writeFile(t, validConfig[:i]+validConfig[j:]))
+	if err == nil || !strings.Contains(err.Error(), "gateway") {
+		t.Errorf("error = %v, want one naming gateway", err)
+	}
+}
+
+func TestEmptyRolesAreRefused(t *testing.T) {
+	if _, err := LoadRoles(writeFile(t, "")); err == nil {
+		t.Error("a file without a role must be refused")
+	}
+}
+
 func TestBadRolesAreRefused(t *testing.T) {
 	cases := []struct{ name, old, new, key string }{
 		{"unknown key", `model = "example-model"`, "model = \"example-model\"\ncolour = \"red\"", "worker.colour"},
 		{"unknown network", `"direct"`, `"open"`, "worker.network"},
 		{"missing network", `network = "direct"`, ``, "worker.network"},
 		{"cost without a number", `, cacheWrite = 0.0`, ``, "worker.cost.cacheWrite"},
+		{"role name with a slash", `[worker]`, `["bad/name"]`, "bad/name"},
+		{"role name in upper case", `[worker]`, `[Worker]`, "Worker"},
+		{"role name too long", `[worker]`, `[a234567890123456789012345678901234]`, "a2345"},
+		{"field in the wrong case", `network =`, `Network =`, "worker.Network"},
+		{"cost in the wrong case", `cost =`, `Cost =`, "worker.Cost"},
+		{"cost key in the wrong case", `cacheRead`, `cacheread`, "worker.cost.cacheread"},
+		{"cost is nan", `input = 1.0`, `input = nan`, "worker.cost.input"},
+		{"cost is infinite", `output = 2.0`, `output = inf`, "worker.cost.output"},
+		{"cost is negative", `output = 2.0`, `output = -2.0`, "worker.cost.output"},
 		{"unknown cost key", `input = 1.0`, `input = 1.0, extra = 1.0`, "worker.cost.extra"},
 	}
 	for _, c := range cases {

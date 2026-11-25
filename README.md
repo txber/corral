@@ -221,10 +221,10 @@ binary = "/opt/nono/bin/nono"
 ```
 
 nono reads the key from `[gateway]`'s `key_file` outside the sandbox and
-sends it as `Authorization: Bearer <key>`; the agent reaches the gateway at
-`/<name>/` below the address it is given. `endpoints` are matched below `upstream`: with
-`https://gateway.example/v1`, write `GET /models` for `/v1/models`. Other
-endpoints get 403.
+sends it as `Authorization: Bearer <key>`. The agent reaches the gateway
+below the path `/<name>/`, where `<name>` is `[gateway]`'s `name`. The
+`endpoints` are matched below `upstream`: with `https://gateway.example/v1`,
+write `GET /models` for `/v1/models`. Other endpoints get 403.
 
 **Roles.** Once `corral run` is finished, nono will take `memory` (such as
 `"2G"`), `max_processes` (0 means no limit) and `network` from a role:
@@ -282,7 +282,8 @@ with a working folder that does not hold the socket:
   --allow <workdir> -- <command> [<arg>...]
 ```
 
-This sends file requests to approvald and blocks the network. Without
+This sends the sandbox's file requests, and any other request nono cannot
+decide itself, to approvald, and blocks the network. Without
 `--block-net` the network is open, as in nono's default profile, and no host
 is asked about. To send host requests to approvald instead, drop
 `--block-net` and also set `network.approval_backends` and

@@ -12,7 +12,7 @@ run = "~/.local/state/corral/run"
 work = "~/work"
 roles = "~/.config/corral/roles.toml"
 # Optional: the helper enables the network mode "direct".
-# helper = "/usr/local/bin/corral"
+# helper = "/opt/corral/bin/corral"
 
 [sandbox]
 use = "nono"

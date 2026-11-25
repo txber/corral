@@ -24,6 +24,7 @@ var reserved = []string{"seq", "ts", "job", "agent_id", "role", "type"}
 type Log struct {
 	mu           sync.Mutex
 	file         *os.File
+	write        func([]byte) (int, error) // file.Write; tests replace it to fail a write
 	job          string
 	seq          int
 	needsNewline bool // the file ends in a torn line
@@ -48,14 +49,16 @@ func Open(path, job string) (*Log, error) {
 		file.Close()
 		return nil, fmt.Errorf("read event log: %w", err)
 	}
-	return &Log{
+	l := &Log{
 		file: file,
 		job:  job,
 		seq:  lastSeq(data),
 		// A torn last line stays as it is; the next record starts on a new line.
 		needsNewline: len(data) > 0 && data[len(data)-1] != '\n',
 		subscribers:  make(map[chan map[string]any]bool),
-	}, nil
+	}
+	l.write = file.Write
+	return l, nil
 }
 
 // lastSeq returns the seq of the last complete line of data that has one, or
@@ -122,7 +125,9 @@ func (l *Log) Write(typ, agentID, role string, fields map[string]any) (map[strin
 		line = append([]byte{'\n'}, line...)
 	}
 	// One write call on an O_APPEND file keeps the line whole.
-	if _, err := l.file.Write(line); err != nil {
+	if _, err := l.write(line); err != nil {
+		// Part of the line may be in the file; the next record starts on a new line.
+		l.needsNewline = true
 		return nil, fmt.Errorf("write event: %w", err)
 	}
 	l.needsNewline = false

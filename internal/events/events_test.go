@@ -3,6 +3,7 @@ package events
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,6 +133,35 @@ func TestTornLastLineIsIgnoredAndNotExtended(t *testing.T) {
 	}
 }
 
+func TestRecordAfterFailedPartialWriteSitsOnItsOwnLine(t *testing.T) {
+	l, path := openLog(t)
+	l.Write("x", "", "", nil)
+	// Simulate a full disk: half of the next line reaches the file, then the write fails.
+	l.write = func(line []byte) (int, error) {
+		n, _ := l.file.Write(line[:len(line)/2])
+		return n, errors.New("no space left on device")
+	}
+	if _, err := l.Write("lost", "", "", nil); err == nil {
+		t.Fatal("write succeeded, want an error")
+	}
+	l.write = l.file.Write
+	rec, err := l.Write("y", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := readLines(t, path)
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3: %q", len(lines), lines)
+	}
+	var got struct{ Seq int }
+	if err := json.Unmarshal([]byte(lines[2]), &got); err != nil {
+		t.Fatalf("new record is not whole JSON: %v", err)
+	}
+	if got.Seq != rec["seq"] {
+		t.Errorf("seq on disk = %d, returned %v", got.Seq, rec["seq"])
+	}
+}
+
 func TestReservedFieldNamesAreRefused(t *testing.T) {
 	l, path := openLog(t)
 	for _, name := range []string{"seq", "ts", "job", "agent_id", "role", "type"} {
@@ -244,25 +274,20 @@ func TestConcurrentWritesKeepSeqUniqueAndLinesWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	seen := make(map[int]bool)
+	prev := 0
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		var rec struct{ Seq int }
 		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
 			t.Fatalf("broken line %q: %v", scanner.Text(), err)
 		}
-		if seen[rec.Seq] {
-			t.Fatalf("seq %d appears twice", rec.Seq)
+		if rec.Seq != prev+1 {
+			t.Fatalf("seq %d follows seq %d in the file", rec.Seq, prev)
 		}
-		seen[rec.Seq] = true
+		prev = rec.Seq
 	}
-	if len(seen) != 1000 {
-		t.Errorf("got %d records, want 1000", len(seen))
-	}
-	for seq := 1; seq <= 1000; seq++ {
-		if !seen[seq] {
-			t.Fatalf("seq %d is missing", seq)
-		}
+	if prev != 1000 {
+		t.Errorf("last seq = %d, want 1000", prev)
 	}
 }
 

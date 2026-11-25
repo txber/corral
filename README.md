@@ -60,7 +60,8 @@ This section grows as the commands above arrive.
 
 ## Configuration
 
-corral reads two TOML files; `examples/` has a complete copy of each.
+The supervisor (`corral run`, not finished yet) reads two TOML files;
+`examples/` has a complete copy of each.
 
 - `corral.toml` says where the model gateway is (`[gateway]`), which paths
   corral uses (`[paths]`), how many agents may run at once (`max_agents`) and

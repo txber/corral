@@ -61,6 +61,9 @@ const (
 	sandboxProfileFile = "sandbox.json"
 	proxyProfileFile   = "proxy.json"
 	approvalSocketFile = "approval.sock"
+	// nonoHome is nono's own home: its state, its config and its temporary
+	// files go below it, where the agent is never granted anything.
+	nonoHome = "nono"
 )
 
 // maxSocketPath is the longest path a Unix socket can be bound at.
@@ -86,12 +89,20 @@ const approvalTimeoutSecs = 30
 
 // profile is the part of nono's profile format that corral writes.
 type profile struct {
-	Extends    string             `json:"extends"`
-	Groups     *groupsSection     `json:"groups,omitempty"`
-	Linux      *linuxSection      `json:"linux,omitempty"`
-	Security   *securitySection   `json:"security,omitempty"`
-	Filesystem *filesystemSection `json:"filesystem,omitempty"`
-	Network    *networkSection    `json:"network,omitempty"`
+	Extends     string              `json:"extends"`
+	Groups      *groupsSection      `json:"groups,omitempty"`
+	Linux       *linuxSection       `json:"linux,omitempty"`
+	Security    *securitySection    `json:"security,omitempty"`
+	Filesystem  *filesystemSection  `json:"filesystem,omitempty"`
+	Network     *networkSection     `json:"network,omitempty"`
+	Environment *environmentSection `json:"environment,omitempty"`
+}
+
+// environmentSection is the program's whole environment: allow_vars []
+// passes none of nono's own variables, set_vars sets the program's.
+type environmentSection struct {
+	AllowVars []string          `json:"allow_vars"`
+	SetVars   map[string]string `json:"set_vars"`
 }
 
 type linuxSection struct {
@@ -159,13 +170,42 @@ type credentialRoute struct {
 // sandbox runs an agent under `nono run`.
 type sandbox struct{ binary string }
 
-// Prepare writes the agent's profile to <StateDir>/sandbox.json.
-func (s sandbox) Prepare(a integration.Agent, readPaths []string) error {
-	p, err := sandboxProfile(a, readPaths)
+// Prepare writes the agent's profile to <StateDir>/sandbox.json and makes
+// nono's home and temporary folder (see Env). The profile holds programEnv,
+// which may hold the gateway token, so it is written with mode 600.
+func (s sandbox) Prepare(a integration.Agent, readPaths []string, programEnv []string) error {
+	p, err := sandboxProfile(a, readPaths, programEnv)
 	if err != nil {
 		return err
 	}
+	home := filepath.Join(a.StateDir, nonoHome)
+	for _, dir := range []string{home, filepath.Join(home, "tmp")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
+	}
 	return writeJSON(filepath.Join(a.StateDir, sandboxProfileFile), p)
+}
+
+// Env gives nono a home and a temporary folder of its own in the agent's
+// state folder. nono keeps its state and config below HOME (no XDG_*
+// variable is set, so nothing moves them elsewhere) and its supervisor
+// socket and helper programs in TMPDIR; none of it may lie where the agent
+// can write, or the agent could change its own next sandbox. No NONO_*
+// variable is passed, as nono would take it for an option. Applying the
+// memory and process limits needs nothing more: under a systemd user
+// service nono makes its cgroup in the delegated tree directly, without
+// talking to the user manager.
+func (s sandbox) Env(a integration.Agent) []string {
+	home := filepath.Join(a.StateDir, nonoHome)
+	return []string{
+		"HOME=" + home,
+		"TMPDIR=" + filepath.Join(home, "tmp"),
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+	}
 }
 
 // sandboxProfile is the profile for one agent. File requests outside it
@@ -174,7 +214,7 @@ func (s sandbox) Prepare(a integration.Agent, readPaths []string) error {
 // about every other host; in mode "direct" the network is confined from
 // outside and the profile says nothing about it. Any other mode is
 // refused, because the profile alone would leave the network open.
-func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
+func sandboxProfile(a integration.Agent, readPaths []string, programEnv []string) (profile, error) {
 	if a.Network != "none" && a.Network != "direct" {
 		return profile{}, fmt.Errorf("nono: network mode %q is not supported, only \"none\" and \"direct\"", a.Network)
 	}
@@ -204,6 +244,10 @@ func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
 	if len(socket) > maxSocketPath {
 		return profile{}, fmt.Errorf("nono: approval socket path %q is longer than %d bytes", socket, maxSocketPath)
 	}
+	vars, err := programVars(programEnv)
+	if err != nil {
+		return profile{}, err
+	}
 	approvals := map[string]approvalBackend{backendName: {
 		Type:        "webhook",
 		URL:         "unix://" + socket,
@@ -231,6 +275,7 @@ func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
 			},
 			Deny: a.Deny,
 		},
+		Environment: &environmentSection{AllowVars: []string{}, SetVars: vars},
 	}
 	if a.Network == "direct" {
 		return p, nil
@@ -246,6 +291,40 @@ func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
 	network.ApprovalDefaults = &approvalDefaults{Backend: backendName}
 	p.Network = &network
 	return p, nil
+}
+
+// envName is the form of a variable name nono accepts in set_vars.
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// programVars turns the program's environment into set_vars. An error
+// names the variable, never its value, which may be the gateway token.
+// PATH is left out: nono refuses it in set_vars and gives the program its
+// own PATH. nono also refuses NONO_* names, and it expands $NAME anywhere
+// in a value and ~ at its start against its own environment, with no way
+// to escape either, so such values are refused rather than changed.
+func programVars(programEnv []string) (map[string]string, error) {
+	vars := map[string]string{}
+	for i, entry := range programEnv {
+		key, value, ok := strings.Cut(entry, "=")
+		switch {
+		case !ok:
+			return nil, fmt.Errorf("nono: program environment entry %d is not KEY=VALUE", i+1)
+		case !envName.MatchString(key):
+			// The name is not shown: in a stray token that holds "=",
+			// it would be part of the token.
+			return nil, fmt.Errorf("nono: program environment entry %d does not start with a variable name nono accepts", i+1)
+		case strings.HasPrefix(key, "NONO_"):
+			return nil, fmt.Errorf("nono: program variable %s: nono reserves the prefix NONO_", key)
+		case key == "PATH":
+			continue
+		case !utf8.ValidString(value) || strings.IndexFunc(value, unicode.IsControl) >= 0:
+			return nil, fmt.Errorf("nono: program variable %s is not valid UTF-8 or holds a control character", key)
+		case strings.Contains(value, "$") || strings.HasPrefix(value, "~"):
+			return nil, fmt.Errorf("nono: program variable %s holds $ or starts with ~, which nono would expand", key)
+		}
+		vars[key] = value
+	}
+	return vars, nil
 }
 
 // gatewayNetwork allows the gateway and nothing else, and routes it with
@@ -338,8 +417,9 @@ func (s sandbox) Approvals(a integration.Agent, decide func(integration.Request)
 
 // StopCommand ends the agent's sandbox session by its name (see
 // sessionName), which starts with a letter and so cannot be read as an
-// option. The supervisor allows the stop command 5 s; a grace of 3 s keeps
-// nono's own escalation to SIGKILL inside that.
+// option. It is run with Env, so that it looks for the session in the
+// state that `nono run` wrote. The supervisor allows the stop command 5 s;
+// a grace of 3 s keeps nono's own escalation to SIGKILL inside that.
 func (s sandbox) StopCommand(a integration.Agent) []string {
 	return []string{s.binary, "stop", "--timeout=3", sessionName(a)}
 }

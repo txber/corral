@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -226,16 +227,25 @@ func checkOneConnection(t *testing.T, data []byte) {
 	}
 }
 
+// tokenMarker starts the stand-in token FuzzProfile passes to the program,
+// so that the token can be looked for wherever it must not appear.
+const tokenMarker = "TOKEN-MARKER-"
+
 // FuzzProfile prepares and wraps an agent with any values. Prepare either
 // refuses or writes profiles that hold every value exactly as given.
 func FuzzProfile(f *testing.F) {
 	f.Add("none", "a1", "/home/you/work/a1", "a1", "/home/you/x", "/usr/local/lib/tool", "2G", 18007,
-		"example", "https://gateway.example/v1", "/home/you/.keys/example", "POST", "/chat/completions", "rpc")
-	f.Add("direct", "a1", "/w", "a1", "/w/s\xff", "/r", "", 0, "example", "https://gateway.example/v1", "/k", "GET", "/models", "")
-	f.Add("direct", "0", "\xb0", "/", "\xd3", "0", "0", 18007, "0", "0", "0", "0", "0", "0")
-	f.Add("proxy", "--force", "-rf", "x", "/a\n", "/b\x00", "--allow=/", 0, "e\u0085", "://", "rel", "", "", "--")
+		"example", "https://gateway.example/v1", "/home/you/.keys/example", "POST", "/chat/completions", "rpc",
+		"TOOL_MODE", "rpc", "1234")
+	f.Add("direct", "a1", "/w", "a1", "/w/s\xff", "/r", "", 0, "example", "https://gateway.example/v1", "/k", "GET", "/models", "",
+		"PATH", "/bin", "$HOME")
+	f.Add("direct", "0", "\xb0", "/", "\xd3", "0", "0", 18007, "0", "0", "0", "0", "0", "0", "NONO_PROFILE", "x", "")
+	f.Add("proxy", "--force", "-rf", "x", "/a\n", "/b\x00", "--allow=/", 0, "e\u0085", "://", "rel", "", "", "--",
+		"A=B", "~/x", "\n")
+	f.Add("direct", "a1", "/w", "a1", "/k", "/r", "", 0, "example", "https://gateway.example/v1", "/k", "GET", "/models", "",
+		"HOME", "/w/.h", "~")
 	f.Fuzz(func(t *testing.T, mode, id, workdir, state, deny, read, memory string, proxyPort int,
-		name, upstream, keyFile, method, endpoint, arg string) {
+		name, upstream, keyFile, method, endpoint, arg, envKey, envValue, token string) {
 		// The state folder is a fresh folder of its own, so that no input
 		// decides where a file is written.
 		stateDir := filepath.Join(t.TempDir(), "s"+strings.ReplaceAll(state, "/", "_"))
@@ -251,16 +261,32 @@ func FuzzProfile(f *testing.F) {
 			ProxyPort: proxyPort,
 		}
 		readPaths := []string{read}
+		token = tokenMarker + token
+		programEnv := []string{
+			"HOME=/home/you/work/a1/.home",
+			"PATH=/usr/local/bin:/usr/bin",
+			envKey + "=" + envValue,
+			integration.TokenEnv + "=" + token,
+		}
 		s := sandbox{binary: binary}
+		// The token may show only where some other input already holds it.
+		inputs := strings.Join([]string{mode, id, workdir, state, deny, read, memory, name, upstream, keyFile, method, endpoint, arg, envKey, envValue}, "\x00")
+		hidden := func(where string, text string) {
+			if !strings.Contains(inputs, tokenMarker) && strings.Contains(text, tokenMarker) {
+				t.Errorf("%s holds the token: %q", where, text)
+			}
+		}
 
-		err := s.Prepare(a, readPaths)
+		err := s.Prepare(a, readPaths, programEnv)
 		file := filepath.Join(stateDir, sandboxProfileFile)
 		if err != nil {
+			hidden("Prepare's error", err.Error())
 			if _, statErr := os.Stat(file); statErr == nil {
 				t.Errorf("Prepare refused (%v) but wrote %s", err, file)
 			}
 		} else {
 			checkPrepared(t, a, readPaths, file)
+			checkEnvironment(t, a, programEnv, file)
 			if stop := s.StopCommand(a); !slices.Equal(stop, []string{binary, "stop", "--timeout=3", "corral-" + id}) {
 				t.Errorf("StopCommand = %q, want the session named corral-%s", stop, id)
 			}
@@ -284,8 +310,15 @@ func FuzzProfile(f *testing.F) {
 			}
 		}
 
+		home := filepath.Join(stateDir, "nono")
+		if env := s.Env(a); !slices.Equal(env, []string{"HOME=" + home, "TMPDIR=" + filepath.Join(home, "tmp"), "PATH=/usr/local/bin:/usr/bin:/bin"}) {
+			t.Errorf("Env = %q, want nono's own home in the state folder", env)
+		}
+
 		command := []string{"pi", arg}
 		argv := s.Wrap(a, command)
+		hidden("Wrap", strings.Join(argv, " "))
+		hidden("StopCommand", strings.Join(s.StopCommand(a), " "))
 		end := len(argv) - len(command) - 1
 		if argv[0] != binary || argv[1] != "run" || argv[end] != "--" || !slices.Equal(argv[end+1:], command) {
 			t.Fatalf("Wrap = %q, want the binary, run, the options, -- and the command", argv)
@@ -349,6 +382,41 @@ func checkPrepared(t *testing.T, a integration.Agent, readPaths []string, file s
 	}
 	if p.Network != nil {
 		checkGateway(t, a.Gateway, p.Network)
+	}
+}
+
+// checkEnvironment checks the environment a sandbox profile gives the
+// program: nothing of nono's own and every variable of programEnv but PATH,
+// each as nono will set it, and nono's own folders kept to their owner.
+func checkEnvironment(t *testing.T, a integration.Agent, programEnv []string, file string) {
+	t.Helper()
+	want := map[string]string{}
+	for _, entry := range programEnv {
+		key, value, _ := strings.Cut(entry, "=")
+		if key != "PATH" {
+			want[key] = value
+		}
+	}
+	var p profile
+	readProfile(t, file, &p)
+	if p.Environment == nil || p.Environment.AllowVars == nil || len(p.Environment.AllowVars) != 0 {
+		t.Fatalf("environment %+v, want allow_vars []", p.Environment)
+	}
+	if !maps.Equal(p.Environment.SetVars, want) {
+		t.Errorf("set_vars %q, want %q", p.Environment.SetVars, want)
+	}
+	for key, value := range p.Environment.SetVars {
+		if !envName.MatchString(key) || strings.HasPrefix(key, "NONO_") {
+			t.Errorf("set_vars has the name %q, which nono refuses", key)
+		}
+		if strings.Contains(value, "$") || strings.HasPrefix(value, "~") || !plainText(key, value) {
+			t.Errorf("set_vars %s has a value nono would not set as given", key)
+		}
+	}
+	for _, dir := range []string{filepath.Join(a.StateDir, "nono"), filepath.Join(a.StateDir, "nono", "tmp")} {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Errorf("%s: %v, want a folder with mode 0700", dir, err)
+		}
 	}
 }
 

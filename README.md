@@ -243,6 +243,15 @@ the sandbox writes its temporary files below its own working folder (the
 runtime integration sets `TMPDIR` there). A tool that insists on `/tmp` or
 a terminal fails inside the sandbox.
 
+corral runs nono with a home of its own in the agent's state folder, so
+nono's state, config and temporary files are out of the agent's reach. The
+program in the sandbox gets exactly the runtime's variables, plus nono's
+`PATH` (`/usr/local/bin:/usr/bin:/bin`, with a folder of nono's helpers in
+front) and the few variables nono adds itself, in `"none"` also its proxy
+variables and the stand-in token. A runtime variable named `NONO_*`, or one
+whose value holds `$` or starts with `~`, is refused, because nono would
+take it as an option or expand it.
+
 **The system must offer:**
 
 - Landlock, as `nono setup --check-only` reports it; corral is tested on a

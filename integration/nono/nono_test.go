@@ -78,10 +78,20 @@ func readJSON(t *testing.T, path string) map[string]any {
 	return v
 }
 
+// sampleEnv is an agent program's environment as a runtime gives it.
+func sampleEnv(a integration.Agent) []string {
+	return []string{
+		"HOME=" + filepath.Join(a.Workdir, ".home"),
+		"TMPDIR=" + filepath.Join(a.Workdir, ".tmp"),
+		"PATH=/usr/local/bin:/usr/bin",
+		"TOOL_MODE=rpc",
+	}
+}
+
 // prepared runs Prepare for a and returns the profile it wrote.
 func prepared(t *testing.T, a integration.Agent, readPaths []string) map[string]any {
 	t.Helper()
-	if err := newSandbox(t).Prepare(a, readPaths); err != nil {
+	if err := newSandbox(t).Prepare(a, readPaths, sampleEnv(a)); err != nil {
 		t.Fatal(err)
 	}
 	return readJSON(t, filepath.Join(a.StateDir, "sandbox.json"))
@@ -270,12 +280,12 @@ func TestModeNoneNeedsAProxyPortAndAnAbsoluteKeyFile(t *testing.T) {
 	s := newSandbox(t)
 	a := sampleAgent(t, "none")
 	a.ProxyPort = 0
-	if err := s.Prepare(a, nil); err == nil {
+	if err := s.Prepare(a, nil, nil); err == nil {
 		t.Error("Prepare without a proxy port succeeded, want an error")
 	}
 	a = sampleAgent(t, "none")
 	a.Gateway.KeyFile = "keys/example"
-	if err := s.Prepare(a, nil); err == nil {
+	if err := s.Prepare(a, nil, nil); err == nil {
 		t.Error("Prepare with a relative key file succeeded, want an error")
 	}
 }
@@ -284,7 +294,7 @@ func TestOnlyModesNoneAndDirectArePrepared(t *testing.T) {
 	s, p := newSandbox(t), newKeyProxy(t)
 	for _, network := range []string{"proxy", "", "open"} {
 		a := sampleAgent(t, network)
-		err := s.Prepare(a, nil)
+		err := s.Prepare(a, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q", network)) {
 			t.Errorf("sandbox Prepare in mode %q = %v, want an error naming the mode", network, err)
 		}
@@ -411,7 +421,7 @@ func TestPrepareRefusesADenyPathThatIsNotValidUTF8(t *testing.T) {
 	a := sampleAgent(t, "direct")
 	a.Workdir = "/w"
 	a.Deny = []string{"/w/s\xff"}
-	err := newSandbox(t).Prepare(a, nil)
+	err := newSandbox(t).Prepare(a, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "deny path") {
 		t.Errorf("Prepare = %v, want an error naming the deny path", err)
 	}
@@ -445,7 +455,7 @@ func TestSandboxPrepareRefusesTextItCannotWriteAsGiven(t *testing.T) {
 			readPaths := []string{"/usr/local/lib/tool"}
 			stateDir := a.StateDir
 			f.set(&a, readPaths, v)
-			err := s.Prepare(a, readPaths)
+			err := s.Prepare(a, readPaths, nil)
 			if err == nil || !strings.Contains(err.Error(), f.name) {
 				t.Errorf("%s with %q: Prepare = %v, want an error naming the %s", f.name, v, err, f.name)
 			}
@@ -494,14 +504,14 @@ func TestPrepareRefusesAnAgentIDThatIsNotPlain(t *testing.T) {
 	for _, id := range []string{"", "-x", "--force", "A1", "1a", "a-1", "a_1", "a 1", "a\xff", "abcdefghijklm"} {
 		a := sampleAgent(t, "direct")
 		a.ID = id
-		if err := s.Prepare(a, nil); err == nil || !strings.Contains(err.Error(), "agent id") {
+		if err := s.Prepare(a, nil, nil); err == nil || !strings.Contains(err.Error(), "agent id") {
 			t.Errorf("Prepare with id %q = %v, want an error naming the agent id", id, err)
 		}
 	}
 	for _, id := range []string{"a", "a1", "abcdefghijkl"} {
 		a := sampleAgent(t, "direct")
 		a.ID = id
-		if err := s.Prepare(a, nil); err != nil {
+		if err := s.Prepare(a, nil, nil); err != nil {
 			t.Errorf("Prepare with id %q: %v", id, err)
 		}
 	}
@@ -510,7 +520,7 @@ func TestPrepareRefusesAnAgentIDThatIsNotPlain(t *testing.T) {
 func TestSandboxProfileRefusesASocketPathTooLongToBind(t *testing.T) {
 	a := sampleAgent(t, "direct")
 	a.StateDir = "/" + strings.Repeat("d", 100)
-	if err := newSandbox(t).Prepare(a, nil); err == nil || !strings.Contains(err.Error(), "longer than 107 bytes") {
+	if err := newSandbox(t).Prepare(a, nil, nil); err == nil || !strings.Contains(err.Error(), "longer than 107 bytes") {
 		t.Errorf("Prepare = %v, want an error about the socket path's length", err)
 	}
 }
@@ -550,4 +560,128 @@ func TestStopArgumentCanNeverMatchASessionID(t *testing.T) {
 			t.Errorf("agent %q: stop argument %q", id, arg)
 		}
 	}
+}
+
+func TestEnvGivesNonoAHomeOfItsOwnInTheStateFolder(t *testing.T) {
+	a := sampleAgent(t, "direct")
+	a.GatewayToken = "stand-in-token-1234"
+	got := newSandbox(t).Env(a)
+	want := []string{
+		"HOME=" + filepath.Join(a.StateDir, "nono"),
+		"TMPDIR=" + filepath.Join(a.StateDir, "nono", "tmp"),
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("Env =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestPrepareCreatesNonosFoldersForItsOwnerOnly(t *testing.T) {
+	a := sampleAgent(t, "direct")
+	// A folder left with a looser mode is tightened.
+	if err := os.Mkdir(filepath.Join(a.StateDir, "nono"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prepared(t, a, nil)
+	for _, dir := range []string{filepath.Join(a.StateDir, "nono"), filepath.Join(a.StateDir, "nono", "tmp")} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != 0o700 {
+			t.Errorf("%s: %v, want a folder with mode 0700", dir, info.Mode())
+		}
+	}
+}
+
+func TestSandboxProfilePassesTheProgramExactlyItsEnvironmentWithoutPath(t *testing.T) {
+	for _, network := range []string{"none", "direct"} {
+		a := sampleAgent(t, network)
+		profile := prepared(t, a, nil)
+		checkField(t, profile, map[string]any{
+			"allow_vars": []any{},
+			"set_vars": map[string]any{
+				"HOME":      "/home/you/work/a1/.home",
+				"TMPDIR":    "/home/you/work/a1/.tmp",
+				"TOOL_MODE": "rpc",
+			},
+		}, "environment")
+	}
+}
+
+func TestSandboxProfileWritesAnEmptyEnvironmentAsEmptyLists(t *testing.T) {
+	a := sampleAgent(t, "direct")
+	if err := newSandbox(t).Prepare(a, nil, []string{"PATH=/usr/bin"}); err != nil {
+		t.Fatal(err)
+	}
+	profile := readJSON(t, filepath.Join(a.StateDir, "sandbox.json"))
+	checkField(t, profile, map[string]any{"allow_vars": []any{}, "set_vars": map[string]any{}}, "environment")
+}
+
+// refused runs Prepare with programEnv and checks that it fails, that the
+// error holds want and none of hidden, and that no profile was written.
+func refused(t *testing.T, programEnv []string, want string, hidden ...string) {
+	t.Helper()
+	a := sampleAgent(t, "direct")
+	err := newSandbox(t).Prepare(a, nil, programEnv)
+	if err == nil {
+		t.Fatalf("Prepare with %q succeeded, want an error", programEnv)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("Prepare with %q = %v, want an error holding %q", programEnv, err, want)
+	}
+	for _, h := range hidden {
+		if strings.Contains(err.Error(), h) {
+			t.Errorf("error %q shows %q", err, h)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(a.StateDir, "sandbox.json")); statErr == nil {
+		t.Errorf("Prepare with %q wrote a profile", programEnv)
+	}
+}
+
+func TestPrepareRefusesVariablesNonoReservesForItself(t *testing.T) {
+	for _, key := range []string{"NONO_PROFILE", "NONO_ALLOW", "NONO_"} {
+		refused(t, []string{key + "=x"}, key)
+	}
+}
+
+func TestPrepareRefusesValuesNonoWouldExpand(t *testing.T) {
+	// nono expands $HOME, $TMPDIR, $XDG_* and others against its own
+	// environment, also inside a word, and ~ at the start, with no escape.
+	for _, value := range []string{"$HOME", "a$b", "$$", "x/$TMPDIR/y", "~", "~/x"} {
+		refused(t, []string{"TOOL_DIR=" + value}, "TOOL_DIR")
+	}
+}
+
+func TestPrepareRefusesWhatIsNotAVariableNonoAccepts(t *testing.T) {
+	for _, entry := range []string{"=x", "1A=x", "A B=x", "A-B=x", "\xff=x"} {
+		refused(t, []string{entry}, "variable")
+	}
+	refused(t, []string{"no-separator"}, "KEY=VALUE", "no-separator")
+	for _, value := range badText {
+		refused(t, []string{"TOOL_DIR=" + value}, "TOOL_DIR")
+	}
+}
+
+func TestTheTokenNeverLeavesTheProfile(t *testing.T) {
+	const token = "stand-in-token-1234"
+	a := sampleAgent(t, "direct")
+	a.GatewayToken = token
+	s := newSandbox(t)
+	programEnv := append(sampleEnv(a), integration.TokenEnv+"="+token)
+	if err := s.Prepare(a, nil, programEnv); err != nil {
+		t.Fatal(err)
+	}
+	checkField(t, readJSON(t, filepath.Join(a.StateDir, "sandbox.json")), token, "environment", "set_vars", integration.TokenEnv)
+	for _, line := range [][]string{s.Wrap(a, []string{"true"}), s.Env(a), s.StopCommand(a)} {
+		if strings.Contains(strings.Join(line, " "), token) {
+			t.Errorf("%q holds the token", line)
+		}
+	}
+	// Refused values are named by their variable only.
+	refused(t, []string{integration.TokenEnv + "=$" + token}, integration.TokenEnv, token)
+	refused(t, []string{integration.TokenEnv + "=" + token + "\n"}, integration.TokenEnv, token)
+	refused(t, []string{token}, "KEY=VALUE", token)
+	refused(t, []string{"stand-in-token=1234"}, "variable name", "stand-in")
 }

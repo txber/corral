@@ -8,7 +8,9 @@
 //
 //	"direct"  The network is confined from outside (namespace and firewall), so the
 //	          sandbox must not restrict it. A KeyProxy serves the gateway at
-//	          GatewayURL; the runtime passes GatewayToken on in TokenEnv.
+//	          GatewayURL; the runtime puts GatewayToken in TokenEnv, which
+//	          reaches the program through the sandbox, as part of the
+//	          programEnv given to Sandbox.Prepare.
 //	"none"    The sandbox itself confines the agent to the model gateway and injects
 //	          the key: it serves the gateway inside the sandbox at
 //	          http://127.0.0.1:<ProxyPort>/<Gateway.Name>, which is GatewayURL, and sets
@@ -110,7 +112,15 @@ type Record struct {
 
 // Sandbox confines one agent process.
 type Sandbox interface {
-	Prepare(a Agent, readPaths []string) error
+	// Prepare writes what the sandbox needs before the launch. programEnv is
+	// the environment the agent program must get inside the sandbox (KEY=VALUE
+	// entries, as Runtime.Env returns them). The sandbox delivers these
+	// variables to the program, and none of its own environment.
+	Prepare(a Agent, readPaths []string, programEnv []string) error
+	// Env is the environment of the sandbox tool's own process: corral starts
+	// the launch and StopCommand with exactly this. The integration builds it;
+	// nothing is inherited, and it holds no secret.
+	Env(a Agent) []string
 	Wrap(a Agent, command []string) []string
 	// Approvals serves the sandbox's own run-time permission requests until stop is
 	// called: decide answers each, report receives every denial the integration

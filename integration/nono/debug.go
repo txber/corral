@@ -65,9 +65,16 @@ func debugProfiles(configFile, dir string, stdout io.Writer) error {
 		ProxyPort: 18000,
 	}
 	readPaths := []string{filepath.Join(cfg.Paths.Work, "shared")}
+	// A sample of what a runtime passes to the program; in mode "direct"
+	// it would also hold the gateway token.
+	programEnv := []string{
+		"HOME=" + filepath.Join(a.Workdir, ".home"),
+		"TMPDIR=" + filepath.Join(a.Workdir, ".tmp"),
+		"PATH=/usr/local/bin:/usr/bin",
+	}
 	for _, network := range []string{"none", "direct"} {
 		a.Network = network
-		p, err := sandboxProfile(a, readPaths)
+		p, err := sandboxProfile(a, readPaths, programEnv)
 		if err != nil {
 			return err
 		}

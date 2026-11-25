@@ -52,6 +52,11 @@ func TestDebugProfilesWritesBothNetworkModesAndTheProxy(t *testing.T) {
 	if _, ok := direct["network"]; ok {
 		t.Errorf("sandbox-direct.json has a network section")
 	}
+	for _, profile := range []map[string]any{none, direct} {
+		if field(profile, "environment", "set_vars", "HOME") == nil {
+			t.Errorf("sandbox profile sets no HOME for the program: %v", profile["environment"])
+		}
+	}
 	proxy := readJSON(t, filepath.Join(out, "proxy.json"))
 	if field(proxy, "network", "allow_domain") == nil {
 		t.Errorf("proxy.json lists no gateway")

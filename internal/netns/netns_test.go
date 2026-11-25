@@ -285,15 +285,23 @@ func TestBadArgumentsExitTwoAndNameTheArgument(t *testing.T) {
 	}
 }
 
-func TestExecWithoutSudoIsRefused(t *testing.T) {
-	// Run as an ordinary user, exec stops at the namespace check or, where
-	// /proc/1 is readable, at the missing SUDO_UID; either way it runs
-	// nothing.
-	t.Setenv("SUDO_UID", "")
-	var stdout, stderr bytes.Buffer
-	code := Main([]string{"exec", "w1", "--env-file", "/run/e", "--", "/opt/agent"}, &stdout, &stderr)
-	if code != 1 || stdout.Len() != 0 {
-		t.Errorf("Main(exec) = %d, stdout %q, stderr %q; want 1", code, stdout.String(), stderr.String())
+func TestRootCommandsRefuseAnOrdinaryUser(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("runs as root")
+	}
+	for _, args := range [][]string{
+		{"up", "w1", "7"},
+		{"allow", "w1", "7", "--target", "10.10.4.7:udp:53"},
+		{"exec", "w1", "--env-file", "/run/e", "--", "/opt/agent"},
+		{"down", "w1", "7"},
+		{"list"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Main(args, &stdout, &stderr)
+		want := "corral netns: " + args[0] + ": must be run as root, for example through sudo\n"
+		if code != 1 || stdout.Len() != 0 || stderr.String() != want {
+			t.Errorf("Main(%q) = %d, stdout %q, stderr %q; want 1 and %q", args, code, stdout.String(), stderr.String(), want)
+		}
 	}
 }
 

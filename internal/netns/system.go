@@ -42,6 +42,9 @@ var toolDirs = []string{"/usr/sbin", "/usr/bin", "/sbin", "/bin"}
 // namespace, such as an agent's.
 func execute(c command, stdout io.Writer) error {
 	if c.name != "enter" {
+		if os.Geteuid() != 0 {
+			return errors.New("must be run as root, for example through sudo")
+		}
 		if err := checkInitialNamespace(); err != nil {
 			return err
 		}
@@ -102,11 +105,13 @@ func up(agentID string, slot int, targets []Target) (err error) {
 		return err
 	}
 	if state, ok := states[agentID]; ok {
-		return fmt.Errorf("agent %s already exists, in slot %d", agentID, state.slot)
+		return fmt.Errorf("agent %s already exists, in slot %d; corral netns down %s %d removes it",
+			agentID, state.slot, agentID, state.slot)
 	}
 	for other, state := range states {
 		if state.slot == slot {
-			return fmt.Errorf("slot %d is in use by agent %s", slot, other)
+			return fmt.Errorf("slot %d is in use by agent %s; corral netns down %s %d removes it",
+				slot, other, other, slot)
 		}
 	}
 
@@ -116,7 +121,9 @@ func up(agentID string, slot int, targets []Target) (err error) {
 	if err := writeState(agentID, agentState{slot: slot, targets: targets}); err != nil {
 		return err
 	}
-	defer onFailure(&err, func() error { return removeState(agentID) })
+	// undoFailed is set by a failed undo step; the state file then stays.
+	var undoFailed bool
+	defer func() { undoState(&err, undoFailed, agentID, slot, removeState) }()
 
 	n := namesFor(agentID, slot)
 	if err := nft(renderBase()); err != nil {
@@ -127,11 +134,11 @@ func up(agentID string, slot int, targets []Target) (err error) {
 	if err := ip("netns", "add", n.Netns); err != nil {
 		return err
 	}
-	defer onFailure(&err, func() error { return deleteNetns(n.Netns) })
+	defer onFailure(&err, &undoFailed, func() error { return deleteNetns(n.Netns) })
 	if err := ip("link", "add", n.Veth, "type", "veth", "peer", "name", "eth0", "netns", n.Netns); err != nil {
 		return err
 	}
-	defer onFailure(&err, func() error { return deleteLink(n.Veth) })
+	defer onFailure(&err, &undoFailed, func() error { return deleteLink(n.Veth) })
 
 	// With IPv6 on, the agent's router solicitations reach the rules on a
 	// host that forwards IPv6, which drop and log them. Off on the root end,
@@ -150,7 +157,7 @@ func up(agentID string, slot int, targets []Target) (err error) {
 	if err := nft(renderAgent(agentID, slot, targets)); err != nil {
 		return err
 	}
-	defer onFailure(&err, func() error { return nft(renderRemove(agentID, slot)) })
+	defer onFailure(&err, &undoFailed, func() error { return nft(renderRemove(agentID, slot)) })
 	for _, args := range [][]string{
 		{"link", "set", n.Veth, "up"},
 		{"-n", n.Netns, "link", "set", "lo", "up"},
@@ -165,13 +172,32 @@ func up(agentID string, slot int, targets []Target) (err error) {
 }
 
 // onFailure runs undo if *err is set when the calling function returns,
-// and adds undo's own error to it. It is meant to be deferred.
-func onFailure(err *error, undo func() error) {
+// and adds undo's own error to it and sets *failed when undo fails. It is
+// meant to be deferred.
+func onFailure(err *error, failed *bool, undo func() error) {
 	if *err == nil {
 		return
 	}
 	if undoErr := undo(); undoErr != nil {
+		*failed = true
 		*err = errors.Join(*err, fmt.Errorf("undoing: %w", undoErr))
+	}
+}
+
+// undoState is the last undo step of a failed up: it removes the agent's
+// state file with remove, unless an earlier undo step failed. Then the file
+// stays, so that what is left keeps its slot on record, and the error says
+// how to remove it.
+func undoState(err *error, undoFailed bool, agentID string, slot int, remove func(agentID string) error) {
+	switch {
+	case *err == nil:
+	case undoFailed:
+		*err = errors.Join(*err, fmt.Errorf("kept the record of agent %s; corral netns down %s %d removes what is left",
+			agentID, agentID, slot))
+	default:
+		if removeErr := remove(agentID); removeErr != nil {
+			*err = errors.Join(*err, fmt.Errorf("undoing: %w", removeErr))
+		}
 	}
 }
 

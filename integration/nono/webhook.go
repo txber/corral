@@ -286,6 +286,11 @@ func (s *server) answer(conn net.Conn) (integration.Request, integration.Decisio
 		if limited.N == 0 && !isTimeout(err) {
 			return nothing, none, reject(http.StatusRequestHeaderFieldsTooLarge, "headers larger than %d bytes", maxHeaderBytes)
 		}
+		if err == io.EOF {
+			// Connected and closed without a byte, as removeStale's probe
+			// does. Headers cut short come back as io.ErrUnexpectedEOF.
+			return nothing, none, err
+		}
 		return nothing, none, readError(err)
 	}
 	if err := checkRequest(req); err != nil {
@@ -407,13 +412,14 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 	if err := json.Unmarshal(raw, &head); err != nil {
 		return integration.Request{}, fmt.Errorf("request: %w", err)
 	}
-	if head.Type == nil {
-		return integration.Request{}, errors.New("request is not an object with a capability_type")
-	}
-	r := integration.Request{Kind: kindOf(*head.Type)}
+	var r integration.Request
 	if head.ID != nil {
 		r.ID = *head.ID
 	}
+	if head.Type == nil {
+		return r, errors.New("request is not an object with a capability_type")
+	}
+	r.Kind = kindOf(*head.Type)
 	switch r.Kind {
 	case "other":
 		r.Detail = fmt.Sprintf("%.100s", *head.Type)
@@ -447,10 +453,10 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 
 // handlerBudget is how long decide may take: nono's patience as the header
 // gives it, minus a margin, so that the answer arrives before nono stops
-// waiting.
+// waiting. A value outside 1 to 3600 seconds counts as missing.
 func handlerBudget(header string) time.Duration {
 	seconds := uint64(defaultTimeoutSecs)
-	if n, err := strconv.ParseUint(header, 10, 20); err == nil {
+	if n, err := strconv.ParseUint(header, 10, 12); err == nil && n >= 1 && n <= 3600 {
 		seconds = n
 	}
 	return time.Duration(max(0, int(seconds)-timeoutMarginSecs)) * time.Second

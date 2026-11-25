@@ -614,3 +614,64 @@ func TestRequestThatEndsEarlyIsAReportedDenial(t *testing.T) {
 		})
 	}
 }
+
+func TestEmptyConnectionIsNotReported(t *testing.T) {
+	var got reports
+	path := serving(t, granting, got.add)
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	time.Sleep(200 * time.Millisecond)
+	if list := got.all(); len(list) != 0 {
+		t.Errorf("reports = %v, want none for a connection that sent nothing", list)
+	}
+}
+
+func TestRefusedSecondServerLeavesNoReport(t *testing.T) {
+	var got reports
+	path := serving(t, granting, got.add)
+	if _, err := serve(path, granting, func(map[string]any) {}); err == nil {
+		t.Fatal("a second server on a live socket started")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if list := got.all(); len(list) != 0 {
+		t.Errorf("the live server reported %v after the probe, want nothing", list)
+	}
+}
+
+func TestReportKeepsTheRequestIDOfARequestWithoutAType(t *testing.T) {
+	for _, request := range []map[string]any{
+		{"request_id": "r9"},
+		{"capability_type": nil, "request_id": "r9"},
+	} {
+		var got reports
+		path := serving(t, granting, got.add)
+		exchange(t, path, post(t, request, 60))
+		if list := got.all(); len(list) != 1 || list[0]["request_id"] != "r9" {
+			t.Errorf("request %v: reports = %v, want one with request_id r9", request, list)
+		}
+	}
+}
+
+func TestHandlerBudgetTakesOnlyAPlausibleTimeout(t *testing.T) {
+	tests := []struct {
+		header string
+		want   time.Duration
+	}{
+		{"", 58 * time.Second},
+		{"30", 28 * time.Second},
+		{"1", 0},
+		{"3600", 3598 * time.Second},
+		{"3601", 58 * time.Second},
+		{"0", 58 * time.Second},
+		{"1000000", 58 * time.Second},
+		{"-5", 58 * time.Second},
+	}
+	for _, tt := range tests {
+		if got := handlerBudget(tt.header); got != tt.want {
+			t.Errorf("handlerBudget(%q) = %v, want %v", tt.header, got, tt.want)
+		}
+	}
+}

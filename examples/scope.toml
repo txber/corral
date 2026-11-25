@@ -1,0 +1,14 @@
+# What `corral approvald` grants. Every other request is denied.
+
+# Network targets: <address or network>:<tcp|udp>:<port or range>. A host the
+# sandbox asks for (such as api.example) is granted when every address it
+# resolved to is covered on tcp.
+targets = [
+  "192.0.2.10:tcp:443",
+  "198.51.100.0/24:tcp:8000-8100",
+]
+
+# Folders the sandboxed program may open, with everything below them.
+paths = [
+  "/home/you/projects/shared",
+]

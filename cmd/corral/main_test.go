@@ -48,3 +48,12 @@ func TestUnknownSubcommandIsUsageError(t *testing.T) {
 		}
 	}
 }
+
+func TestApprovaldIsDispatched(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"approvald"}, &stdout, &stderr)
+	want := "usage: corral approvald"
+	if code != 2 || !strings.HasPrefix(stderr.String(), want) {
+		t.Errorf("run(approvald) = %d, %q; want 2 and a message starting %q", code, stderr.String(), want)
+	}
+}

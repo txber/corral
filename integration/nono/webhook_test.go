@@ -581,6 +581,11 @@ func TestRequestThatEndsEarlyIsAReportedDenial(t *testing.T) {
 	for name, data := range map[string]string{
 		"body cut short":    "POST / HTTP/1.1\r\nContent-Length: 20\r\n\r\n{\"backend\"",
 		"headers cut short": "POST / HTTP/1.1\r\nContent-Length: 2\r\n",
+		// A first line without a line end that fills the read buffer
+		// exactly must not pass for a connection that sent nothing.
+		"4096 bytes, no line end":  strings.Repeat("x", 4096),
+		"8192 bytes, no line end":  "POST /" + strings.Repeat("a", 8186),
+		"12288 bytes, no line end": strings.Repeat("x", 12288),
 	} {
 		t.Run(name, func(t *testing.T) {
 			var got reports
@@ -645,6 +650,8 @@ func TestReportKeepsTheRequestIDOfARequestWithoutAType(t *testing.T) {
 	for _, request := range []map[string]any{
 		{"request_id": "r9"},
 		{"capability_type": nil, "request_id": "r9"},
+		{"capability_type": 5, "request_id": "r9"},
+		{"capability_type": map[string]any{}, "request_id": "r9"},
 	} {
 		var got reports
 		path := serving(t, granting, got.add)

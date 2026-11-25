@@ -281,15 +281,16 @@ func (s *server) answer(conn net.Conn) (integration.Request, integration.Decisio
 	var nothing integration.Request
 	_ = conn.SetReadDeadline(time.Now().Add(receiveTimeout))
 	limited := &io.LimitedReader{R: conn, N: maxHeaderBytes}
-	req, err := http.ReadRequest(bufio.NewReader(limited))
+	reader := bufio.NewReader(limited)
+	if _, err := reader.Peek(1); err == io.EOF {
+		// Connected and closed without a byte, as removeStale's probe does.
+		// Every error after the first byte is reported.
+		return nothing, none, err
+	}
+	req, err := http.ReadRequest(reader)
 	if err != nil {
 		if limited.N == 0 && !isTimeout(err) {
 			return nothing, none, reject(http.StatusRequestHeaderFieldsTooLarge, "headers larger than %d bytes", maxHeaderBytes)
-		}
-		if err == io.EOF {
-			// Connected and closed without a byte, as removeStale's probe
-			// does. Headers cut short come back as io.ErrUnexpectedEOF.
-			return nothing, none, err
 		}
 		return nothing, none, readError(err)
 	}
@@ -409,12 +410,15 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 		Type *string `json:"capability_type"`
 		ID   *string `json:"request_id"`
 	}
-	if err := json.Unmarshal(raw, &head); err != nil {
-		return integration.Request{}, fmt.Errorf("request: %w", err)
-	}
+	// Unmarshal fills what it can before it reports a wrong type, so the id
+	// is kept even when the type cannot be read.
+	err := json.Unmarshal(raw, &head)
 	var r integration.Request
 	if head.ID != nil {
 		r.ID = *head.ID
+	}
+	if err != nil {
+		return r, fmt.Errorf("request: %w", err)
 	}
 	if head.Type == nil {
 		return r, errors.New("request is not an object with a capability_type")
@@ -456,7 +460,7 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 // waiting. A value outside 1 to 3600 seconds counts as missing.
 func handlerBudget(header string) time.Duration {
 	seconds := uint64(defaultTimeoutSecs)
-	if n, err := strconv.ParseUint(header, 10, 12); err == nil && n >= 1 && n <= 3600 {
+	if n, err := strconv.ParseUint(header, 10, 64); err == nil && n >= 1 && n <= 3600 {
 		seconds = n
 	}
 	return time.Duration(max(0, int(seconds)-timeoutMarginSecs)) * time.Second

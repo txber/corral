@@ -183,7 +183,7 @@ type rawRole struct {
 	Cost         *struct {
 		Input, Output, CacheRead, CacheWrite *float64
 	}
-	Options map[string]any
+	Options any // checked to be a table: a map field would drop anything else
 }
 
 // LoadRoles reads and checks roles.toml.
@@ -218,6 +218,10 @@ func LoadRoles(path string) (map[string]Role, error) {
 		if r.MaxProcesses < 0 {
 			return nil, fmt.Errorf("%s: %s.max_processes is negative", path, name)
 		}
+		options, ok := r.Options.(map[string]any)
+		if r.Options != nil && !ok {
+			return nil, fmt.Errorf("%s: %s.options must be a table", path, name)
+		}
 		if r.Cost == nil {
 			return nil, fmt.Errorf("%s: %s.cost is missing", path, name)
 		}
@@ -243,7 +247,7 @@ func LoadRoles(path string) (map[string]Role, error) {
 			Model:   r.Model,
 			Limits:  integration.Limits{Memory: r.Memory, MaxProcesses: r.MaxProcesses},
 			Cost:    integration.Cost{Input: input, Output: output, CacheRead: cacheRead, CacheWrite: cacheWrite},
-			Options: r.Options,
+			Options: options,
 		}
 	}
 	return roles, nil

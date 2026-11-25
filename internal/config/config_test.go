@@ -285,6 +285,22 @@ func TestOptionTablesStayFreeForm(t *testing.T) {
 	}
 }
 
+func TestRoleOptionsMustBeATable(t *testing.T) {
+	for _, value := range []string{`5`, `["read"]`, `"tools=read"`, `[]`, `[{ tools = "read" }]`} {
+		_, err := LoadRoles(writeFile(t, validRole+"options = "+value+"\n"))
+		if err == nil || !strings.Contains(err.Error(), "worker.options must be a table") {
+			t.Errorf("options = %s: error = %v, want one saying it must be a table", value, err)
+		}
+	}
+	roles, err := LoadRoles(writeFile(t, validRole+"options = {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roles["worker"].Options == nil {
+		t.Error("an empty options table was lost")
+	}
+}
+
 func TestTextMustBeValidUTF8WithoutControlCharacters(t *testing.T) {
 	t.Setenv("HOME", "/home/you")
 	configs := []struct{ name, old, new, key string }{
@@ -486,6 +502,8 @@ func FuzzLoadRoles(f *testing.F) {
 	f.Add("")
 	f.Add(validRole + "colour.x = 1\n")
 	f.Add(validRole + "COST.extra = 1\n")
+	f.Add(validRole + "options = [\"read\"]\n")
+	f.Add(validRole + "options = { tools = \"read\" }\n")
 	f.Add("worker.COST.Input = 99.0\n" + validRole)
 	f.Add(strings.Replace(validRole, "[worker]", `["`+strings.Repeat("w", 400)+`"]`, 1))
 	f.Add(strings.Replace(validRole, `"direct"`, `"`+strings.Repeat("d", 400)+`"`, 1))
@@ -515,6 +533,11 @@ func FuzzLoadRoles(f *testing.F) {
 			}
 			if r.Model == "" || checkText("", "", r.Model) != nil || checkText("", "", r.Limits.Memory) != nil {
 				t.Errorf("%s: model %q, memory %q", name, r.Model, r.Limits.Memory)
+			}
+			table, _ := doc[name].(map[string]any)
+			_, isTable := table["options"].(map[string]any)
+			if (r.Options != nil) != isTable {
+				t.Errorf("%s: options %v from %v", name, r.Options, table["options"])
 			}
 			if r.Limits.MaxProcesses < 0 {
 				t.Errorf("%s.max_processes = %d", name, r.Limits.MaxProcesses)

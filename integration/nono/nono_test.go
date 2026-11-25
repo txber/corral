@@ -369,6 +369,113 @@ func TestFactoriesRefuseAMissingOrRelativeBinaryAndUnknownOptions(t *testing.T) 
 	newKeyProxy(t)
 }
 
+// badText holds values a profile or a command line must not carry: JSON
+// writes an invalid UTF-8 byte as U+FFFD, which names another file.
+var badText = []string{"\xff", "\n", "\x00", "\x7f", "\u0085"}
+
+func TestPrepareRefusesADenyPathThatIsNotValidUTF8(t *testing.T) {
+	// /w/s\xff is a valid Linux path inside the folder the agent may write;
+	// written as /w/s�, the profile would deny a folder that does not
+	// exist and leave the real one open.
+	a := sampleAgent(t, "direct")
+	a.Workdir = "/w"
+	a.Deny = []string{"/w/s\xff"}
+	err := newSandbox(t).Prepare(a, nil)
+	if err == nil || !strings.Contains(err.Error(), "deny path") {
+		t.Errorf("Prepare = %v, want an error naming the deny path", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(a.StateDir, "sandbox.json")); statErr == nil {
+		t.Error("a profile was written")
+	}
+}
+
+func TestSandboxPrepareRefusesTextItCannotWriteAsGiven(t *testing.T) {
+	fields := []struct {
+		name string
+		set  func(a *integration.Agent, readPaths []string, v string)
+	}{
+		{"deny path", func(a *integration.Agent, _ []string, v string) { a.Deny = append(a.Deny, "/home/you/x"+v) }},
+		{"read path", func(_ *integration.Agent, readPaths []string, v string) { readPaths[0] += v }},
+		{"working folder", func(a *integration.Agent, _ []string, v string) { a.Workdir += v }},
+		{"state folder", func(a *integration.Agent, _ []string, v string) { a.StateDir += v }},
+		{"share folder", func(a *integration.Agent, _ []string, v string) { a.ShareDir = "/home/you/share" + v }},
+		{"memory limit", func(a *integration.Agent, _ []string, v string) { a.Limits.Memory += v }},
+		{"gateway name", func(a *integration.Agent, _ []string, v string) { a.Gateway.Name += v }},
+		{"gateway upstream", func(a *integration.Agent, _ []string, v string) { a.Gateway.Upstream += v }},
+		{"gateway key file", func(a *integration.Agent, _ []string, v string) { a.Gateway.KeyFile += v }},
+		{"gateway endpoint method", func(a *integration.Agent, _ []string, v string) { a.Gateway.Endpoints[0].Method += v }},
+		{"gateway endpoint path", func(a *integration.Agent, _ []string, v string) { a.Gateway.Endpoints[1].Path += v }},
+	}
+	s := newSandbox(t)
+	for _, f := range fields {
+		for _, v := range badText {
+			a := sampleAgent(t, "none")
+			a.Gateway.Endpoints = slices.Clone(a.Gateway.Endpoints)
+			readPaths := []string{"/usr/local/lib/tool"}
+			stateDir := a.StateDir
+			f.set(&a, readPaths, v)
+			err := s.Prepare(a, readPaths)
+			if err == nil || !strings.Contains(err.Error(), f.name) {
+				t.Errorf("%s with %q: Prepare = %v, want an error naming the %s", f.name, v, err, f.name)
+			}
+			if _, statErr := os.Stat(filepath.Join(stateDir, "sandbox.json")); statErr == nil {
+				t.Errorf("%s with %q: a profile was written", f.name, v)
+			}
+		}
+	}
+}
+
+func TestKeyProxyPrepareRefusesTextItCannotWriteAsGiven(t *testing.T) {
+	fields := []struct {
+		name string
+		set  func(a *integration.Agent, v string)
+	}{
+		{"state folder", func(a *integration.Agent, v string) { a.StateDir += v }},
+		{"gateway name", func(a *integration.Agent, v string) { a.Gateway.Name += v }},
+		{"gateway upstream", func(a *integration.Agent, v string) { a.Gateway.Upstream += v }},
+		{"gateway key file", func(a *integration.Agent, v string) { a.Gateway.KeyFile += v }},
+		{"gateway endpoint method", func(a *integration.Agent, v string) { a.Gateway.Endpoints[0].Method += v }},
+		{"gateway endpoint path", func(a *integration.Agent, v string) { a.Gateway.Endpoints[1].Path += v }},
+	}
+	p := newKeyProxy(t)
+	listen := netip.MustParseAddrPort("198.18.7.1:18007")
+	for _, f := range fields {
+		for _, v := range badText {
+			a := sampleAgent(t, "direct")
+			a.Gateway.Endpoints = slices.Clone(a.Gateway.Endpoints)
+			stateDir := a.StateDir
+			f.set(&a, v)
+			err := p.Prepare(a, a.Gateway, listen)
+			if err == nil || !strings.Contains(err.Error(), f.name) {
+				t.Errorf("%s with %q: Prepare = %v, want an error naming the %s", f.name, v, err, f.name)
+			}
+			if _, statErr := os.Stat(filepath.Join(stateDir, "proxy.json")); statErr == nil {
+				t.Errorf("%s with %q: a profile was written", f.name, v)
+			}
+		}
+	}
+}
+
+func TestPrepareRefusesAnAgentIDThatIsNotPlain(t *testing.T) {
+	// The id goes on the stop command line as an argument of its own, where
+	// one that starts with "-" would be read as an option.
+	s := newSandbox(t)
+	for _, id := range []string{"", "-x", "--force", "A1", "1a", "a-1", "a_1", "a 1", "a\xff", "abcdefghijklm"} {
+		a := sampleAgent(t, "direct")
+		a.ID = id
+		if err := s.Prepare(a, nil); err == nil || !strings.Contains(err.Error(), "agent id") {
+			t.Errorf("Prepare with id %q = %v, want an error naming the agent id", id, err)
+		}
+	}
+	for _, id := range []string{"a", "a1", "abcdefghijkl"} {
+		a := sampleAgent(t, "direct")
+		a.ID = id
+		if err := s.Prepare(a, nil); err != nil {
+			t.Errorf("Prepare with id %q: %v", id, err)
+		}
+	}
+}
+
 func TestSandboxProfileRefusesASocketPathTooLongToBind(t *testing.T) {
 	a := sampleAgent(t, "direct")
 	a.StateDir = "/" + strings.Repeat("d", 100)

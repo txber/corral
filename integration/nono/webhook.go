@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -224,7 +225,16 @@ type rejection struct {
 func (r *rejection) Error() string { return r.reason }
 
 func reject(status int, format string, args ...any) *rejection {
-	return &rejection{status: status, reason: fmt.Sprintf(format, args...)}
+	return &rejection{status: status, reason: cut(fmt.Sprintf(format, args...))}
+}
+
+// maxRecordText is the most characters a report or a printed line keeps of
+// one text: a request id alone could otherwise be as long as the body.
+const maxRecordText = 200
+
+// cut keeps the first maxRecordText characters of s.
+func cut(s string) string {
+	return fmt.Sprintf("%.*s", maxRecordText, s)
 }
 
 // handle answers the first request on conn and closes it. Anything the
@@ -258,8 +268,9 @@ func (s *server) handle(conn net.Conn) {
 	}
 }
 
-// reportDenial passes a denial to report. A report that panics loses its
-// record but not the answer.
+// reportDenial passes a denial to report, with every text cut to
+// maxRecordText characters. A report that panics loses its record but not
+// the answer.
 func (s *server) reportDenial(r *rejection) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -268,24 +279,31 @@ func (s *server) reportDenial(r *rejection) {
 	}()
 	record := map[string]any{"status": r.status, "reason": r.reason}
 	for k, v := range r.context {
+		if text, ok := v.(string); ok {
+			v = cut(text)
+		}
 		record[k] = v
 	}
 	s.report(record)
 }
 
 // answer reads one request from conn and decides it. An error that is not
-// a *rejection means there is nobody to answer: the client closed the
-// connection without sending anything, or the server is closing.
+// a *rejection means there is nobody to answer, and nothing is reported:
+// the connection closed without sending a byte, or the server is closing.
+// Every other failure, also a client that sends nothing until the receive
+// deadline, is a rejection.
 func (s *server) answer(conn net.Conn) (integration.Request, integration.Decision, error) {
 	var none integration.Decision
 	var nothing integration.Request
 	_ = conn.SetReadDeadline(time.Now().Add(receiveTimeout))
 	limited := &io.LimitedReader{R: conn, N: maxHeaderBytes}
 	reader := bufio.NewReader(limited)
-	if _, err := reader.Peek(1); err == io.EOF {
-		// Connected and closed without a byte, as removeStale's probe does.
-		// Every error after the first byte is reported.
-		return nothing, none, err
+	if _, err := reader.Peek(1); err != nil {
+		if err == io.EOF {
+			// Connected and closed without a byte, as removeStale's probe does.
+			return nothing, none, err
+		}
+		return nothing, none, readError(err)
 	}
 	req, err := http.ReadRequest(reader)
 	if err != nil {
@@ -374,7 +392,7 @@ func parseBody(body []byte) (integration.Request, map[string]any, error) {
 		err = errors.New("'backend' is not a string")
 	}
 	if err != nil {
-		r := reject(http.StatusBadRequest, "%.300v", err)
+		r := reject(http.StatusBadRequest, "%v", err)
 		r.context = context
 		return integration.Request{}, context, r
 	}
@@ -393,10 +411,10 @@ func kindOf(capabilityType string) string {
 }
 
 // parseRequest turns nono's request object into corral's request. A file
-// request ("capability") needs path and access, a network request needs
-// host, port and the addresses nono resolved; every other type becomes
-// "other" with the type as its detail. With an error it still returns the
-// kind and id it read, for the report of the denial.
+// request ("capability") needs an absolute path and an access, a network
+// request needs host, port and the addresses nono resolved; every other
+// type becomes "other" with the type as its detail. With an error it still
+// returns the kind and id it read, for the report of the denial.
 func parseRequest(raw json.RawMessage) (integration.Request, error) {
 	var fields struct {
 		Path        *string   `json:"path"`
@@ -434,6 +452,9 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 		}
 		if fields.Path == nil || fields.Access == nil {
 			return r, errors.New("file request needs the strings path and access")
+		}
+		if !filepath.IsAbs(*fields.Path) || *fields.Access == "" {
+			return r, fmt.Errorf("file request needs an absolute path and an access, got path %.200q and access %.20q", *fields.Path, *fields.Access)
 		}
 		r.Path, r.Access = *fields.Path, *fields.Access
 	case "network":

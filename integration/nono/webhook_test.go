@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/txber/corral/integration"
 )
@@ -475,6 +476,45 @@ func TestReportsSayWhatTheRequestSaidAboutItself(t *testing.T) {
 	}
 }
 
+// longTexts returns the names of the string values in record that are
+// longer than 200 characters.
+func longTexts(record map[string]any) []string {
+	var long []string
+	for k, v := range record {
+		if s, ok := v.(string); ok && utf8.RuneCountInString(s) > 200 {
+			long = append(long, k)
+		}
+	}
+	return long
+}
+
+func TestReportsCutEveryTextTo200Characters(t *testing.T) {
+	long := strings.Repeat("é", 5000)
+	requests := map[string][]byte{
+		"long request id and backend": func() []byte {
+			body, _ := json.Marshal(map[string]any{"backend": long, "request": map[string]any{"capability_type": 5, "request_id": long}})
+			return postBytes(body, 60)
+		}(),
+		"long target":     []byte("POST /" + strings.Repeat("a", 5000) + " HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"),
+		"long first line": []byte(strings.Repeat("x", 5000) + "\r\n\r\n"),
+	}
+	for name, data := range requests {
+		var got reports
+		path := serving(t, granting, got.add)
+		answer := exchange(t, path, data)
+		list := got.all()
+		if len(list) != 1 {
+			t.Fatalf("%s: reports = %v, want one", name, list)
+		}
+		if long := longTexts(list[0]); len(long) > 0 {
+			t.Errorf("%s: report has texts longer than 200 characters: %v", name, long)
+		}
+		if list[0]["reason"] != answer.body["reason"] {
+			t.Errorf("%s: report reason %q, answer reason %q; want the same", name, list[0]["reason"], answer.body["reason"])
+		}
+	}
+}
+
 func TestDecisionsOfDecideAreNotReported(t *testing.T) {
 	var got reports
 	path := serving(t, func(integration.Request) integration.Decision {
@@ -659,6 +699,80 @@ func TestReportKeepsTheRequestIDOfARequestWithoutAType(t *testing.T) {
 		if list := got.all(); len(list) != 1 || list[0]["request_id"] != "r9" {
 			t.Errorf("request %v: reports = %v, want one with request_id r9", request, list)
 		}
+	}
+}
+
+func TestFileRequestWithoutAnAbsolutePathOrAnAccessIsAReported400(t *testing.T) {
+	called := false
+	var mu sync.Mutex
+	decide := func(integration.Request) integration.Decision {
+		mu.Lock()
+		defer mu.Unlock()
+		called = true
+		return integration.Decision{Decision: "denied", Reason: "decided"}
+	}
+	for _, request := range []map[string]any{
+		with(capability, "path", ""),
+		with(capability, "path", "x"),
+		with(capability, "path", "./srv/data/x"),
+		with(capability, "access", ""),
+	} {
+		var got reports
+		path := serving(t, decide, got.add)
+		answer := exchange(t, path, post(t, request, 60))
+		if answer.status != 400 || answer.body["decision"] != "denied" {
+			t.Errorf("path %q, access %q: answer %d %v, want 400 and a denial", request["path"], request["access"], answer.status, answer.body)
+		}
+		if list := got.all(); len(list) != 1 || list[0]["status"] != 400 {
+			t.Errorf("path %q, access %q: reports = %v, want one with status 400", request["path"], request["access"], list)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if called {
+		t.Error("decide was called")
+	}
+}
+
+func TestNothingSentUntilTheReceiveDeadlineIsAReported408(t *testing.T) {
+	saved := receiveTimeout
+	receiveTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { receiveTimeout = saved })
+	var got reports
+	path := serving(t, granting, got.add)
+	answer := exchange(t, path, nil)
+	if answer.status != 408 || answer.body["decision"] != "denied" {
+		t.Errorf("answer %d %v, want 408 and a denial", answer.status, answer.body)
+	}
+	if list := got.all(); len(list) != 1 || list[0]["status"] != 408 {
+		t.Errorf("reports = %v, want one with status 408", list)
+	}
+}
+
+func TestNothingSentUntilCloseIsSilent(t *testing.T) {
+	var got reports
+	path := socketPath(t)
+	s, err := serve(path, granting, got.add)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(100 * time.Millisecond) // the server is now waiting for the first byte
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if answer, _ := io.ReadAll(conn); len(answer) != 0 {
+		t.Errorf("answer %q, want none", answer)
+	}
+	if list := got.all(); len(list) != 0 {
+		t.Errorf("reports = %v, want none", list)
 	}
 }
 

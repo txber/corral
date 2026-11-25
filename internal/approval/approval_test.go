@@ -302,6 +302,39 @@ func TestLongRequestTextsAreCutInTheReason(t *testing.T) {
 	}
 }
 
+func TestEscapedRequestTextsAreCutInTheReason(t *testing.T) {
+	// A rune that is not printable is quoted as up to ten bytes.
+	long := strings.Repeat("\U0010fffe", 1000)
+	escaping := func(string) (string, error) { return "", errors.New(long) }
+	tests := []struct {
+		name    string
+		request integration.Request
+		resolve func(string) (string, error)
+	}{
+		{"kind", integration.Request{Kind: long}, nil},
+		{"relative path", pathRequest(long), identity},
+		{"path with NUL bytes", pathRequest("/" + strings.Repeat("\x00", 1000)), identity},
+		{"path outside", pathRequest("/" + long), identity},
+		{"path and error that cannot be resolved", pathRequest("/" + long), escaping},
+		{"host without addresses", integration.Request{Kind: "network", Host: long, Port: 445}, nil},
+		{"address", networkRequest(445, long), nil},
+	}
+	for _, tt := range tests {
+		d := Decide(tt.request, testScope(t), tt.resolve)
+		if d.Decision != "denied" {
+			t.Errorf("%s: decision = %q, want denied", tt.name, d.Decision)
+		}
+		if len(d.Reason) > 400 {
+			t.Errorf("%s: reason is %d bytes long, want at most 400", tt.name, len(d.Reason))
+		}
+	}
+	// A grant names the path too.
+	inside := "/w/a/" + long
+	if d := Decide(pathRequest(inside), testScope(t), identity); d.Decision != "granted" || len(d.Reason) > 400 {
+		t.Errorf("path inside: decision %q with a reason of %d bytes, want granted and at most 400", d.Decision, len(d.Reason))
+	}
+}
+
 // realTempDir returns a fresh temporary folder with every symbolic link in
 // its path resolved, so that it can serve as a scope path.
 func realTempDir(t *testing.T) string {

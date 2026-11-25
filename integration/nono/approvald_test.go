@@ -166,6 +166,65 @@ func TestApprovaldRefusesABadCommandLineOrScope(t *testing.T) {
 	}
 }
 
+func TestScopeFileTakesOnlyTargetsAndPathsSpeltExactly(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		content string
+		key     string // the key the error must name; "" when any error will do
+	}{
+		{"Targets = [\"192.0.2.10:tcp:443\"]\n", "Targets"},
+		{"targets = []\nPATHS = [\"/home/you/shared\"]\n", "PATHS"},
+		{"targets = []\nhosts = []\n", "hosts"},
+		{"targets = []\n[extra]\nx = 1\n", "extra"},
+		{"extra.x = 1\n", "extra"},
+		{"targets.x = 1\n", ""},
+		{"[paths]\nx = \"/home/you\"\n", ""},
+		{"targets = \"192.0.2.10:tcp:443\"\n", ""},
+	}
+	for i, tt := range tests {
+		file := filepath.Join(dir, fmt.Sprintf("scope%d.toml", i))
+		if err := os.WriteFile(file, []byte(tt.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadScope(file)
+		if err == nil || !strings.Contains(err.Error(), tt.key) {
+			t.Errorf("scope file %q: loadScope = %v, want an error naming %q", tt.content, err, tt.key)
+		}
+	}
+	file := filepath.Join(dir, "good.toml")
+	if err := os.WriteFile(file, []byte("targets = [\"192.0.2.10:tcp:443\"]\npaths = [\"/home/you/shared\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadScope(file)
+	if err != nil || len(s.Targets) != 1 || len(s.Paths) != 1 {
+		t.Errorf("loadScope = %+v, %v; want one target and one path", s, err)
+	}
+}
+
+func TestApprovaldCutsEveryPrintedTextTo200Characters(t *testing.T) {
+	long := strings.Repeat("é", 5000)
+	var out bytes.Buffer
+	p := &printer{w: &out}
+	denied := integration.Decision{Decision: "denied", Reason: long}
+	p.decision(integration.Request{Kind: "path", ID: long, Path: long, Access: long}, denied)
+	p.decision(integration.Request{Kind: "network", ID: long, Host: long, Port: 443}, denied)
+	p.decision(integration.Request{Kind: long, ID: long, Detail: long}, denied)
+	p.denial(map[string]any{"status": 400, "reason": long, "backend": long, "request_id": long})
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("printed %d lines, want 4", len(lines))
+	}
+	for i, text := range lines {
+		var line map[string]any
+		if err := json.Unmarshal([]byte(text), &line); err != nil {
+			t.Fatalf("line %d: %v", i, err)
+		}
+		if long := longTexts(line); len(long) > 0 {
+			t.Errorf("line %d has texts longer than 200 characters: %v", i, long)
+		}
+	}
+}
+
 // lockedBuffer is a bytes.Buffer that the test may read while the server
 // writes to it.
 type lockedBuffer struct {

@@ -14,9 +14,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/txber/corral/integration"
 )
@@ -62,6 +65,10 @@ const (
 
 // maxSocketPath is the longest path a Unix socket can be bound at.
 const maxSocketPath = 107
+
+// agentID is the form of an agent id the sandbox accepts: it can never be
+// read as an option.
+var agentID = regexp.MustCompile(`^[a-z][a-z0-9]{0,11}$`)
 
 // backendName is the name the profiles give the approval endpoint.
 const backendName = "corral"
@@ -158,6 +165,25 @@ func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
 	if a.Network != "none" && a.Network != "direct" {
 		return profile{}, fmt.Errorf("nono: network mode %q is not supported, only \"none\" and \"direct\"", a.Network)
 	}
+	// The id is an argument of its own on the stop command line.
+	if !agentID.MatchString(a.ID) {
+		return profile{}, fmt.Errorf("nono: agent id %q must match %s", a.ID, agentID)
+	}
+	fields := []textField{
+		{"working folder", a.Workdir},
+		{"state folder", a.StateDir},
+		{"share folder", a.ShareDir},
+		{"memory limit", a.Limits.Memory},
+	}
+	for _, p := range a.Deny {
+		fields = append(fields, textField{"deny path", p})
+	}
+	for _, p := range readPaths {
+		fields = append(fields, textField{"read path", p})
+	}
+	if err := checkText(fields); err != nil {
+		return profile{}, err
+	}
 	if !filepath.IsAbs(a.StateDir) {
 		return profile{}, fmt.Errorf("nono: state folder %q is not absolute", a.StateDir)
 	}
@@ -200,6 +226,17 @@ func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
 // the key from the gateway's key file; envVar names the variable that
 // holds the stand-in token.
 func gatewayNetwork(g integration.Gateway, envVar string) (networkSection, error) {
+	fields := []textField{
+		{"gateway name", g.Name},
+		{"gateway upstream", g.Upstream},
+		{"gateway key file", g.KeyFile},
+	}
+	for _, e := range g.Endpoints {
+		fields = append(fields, textField{"gateway endpoint method", e.Method}, textField{"gateway endpoint path", e.Path})
+	}
+	if err := checkText(fields); err != nil {
+		return networkSection{}, err
+	}
 	upstream, err := url.Parse(g.Upstream)
 	if err != nil || upstream.Hostname() == "" {
 		return networkSection{}, fmt.Errorf("nono: gateway upstream %q has no host", g.Upstream)
@@ -273,7 +310,9 @@ func (s sandbox) Approvals(a integration.Agent, decide func(integration.Request)
 	return srv.Close, nil
 }
 
-// StopCommand ends the agent's sandbox session by its name.
+// StopCommand ends the agent's sandbox session by its name. nono stop
+// names no end-of-options marker; Prepare refuses an id that does not
+// start with a letter, so the id cannot be read as an option.
 func (s sandbox) StopCommand(a integration.Agent) []string {
 	return []string{s.binary, "stop", a.ID}
 }
@@ -292,6 +331,10 @@ type keyProxy struct{ binary string }
 func (k keyProxy) Prepare(a integration.Agent, g integration.Gateway, _ netip.AddrPort) error {
 	if a.Network != "direct" {
 		return fmt.Errorf("nono: the key proxy serves only network mode \"direct\", not %q", a.Network)
+	}
+	// The profile's path goes on the proxy's command line.
+	if err := checkText([]textField{{"state folder", a.StateDir}}); err != nil {
+		return err
 	}
 	p, err := proxyProfile(g)
 	if err != nil {
@@ -325,6 +368,26 @@ func (k keyProxy) Command(a integration.Agent, g integration.Gateway, listen net
 // URL is where the agent reaches the gateway through the proxy.
 func (k keyProxy) URL(g integration.Gateway, listen netip.AddrPort) string {
 	return "http://" + listen.String() + "/" + g.Name
+}
+
+// textField is a value the integration writes into a profile or puts on a
+// command line, with the name an error gives it.
+type textField struct{ name, value string }
+
+// checkText refuses a value that is not valid UTF-8 or holds a control
+// character. JSON writes an invalid byte as U+FFFD, so a folder to deny
+// would become a folder that does not exist while the real one stayed
+// open; a control character has no place in a path, a name or an option.
+func checkText(fields []textField) error {
+	for _, f := range fields {
+		if !utf8.ValidString(f.value) {
+			return fmt.Errorf("nono: %s %q is not valid UTF-8", f.name, f.value)
+		}
+		if strings.IndexFunc(f.value, unicode.IsControl) >= 0 {
+			return fmt.Errorf("nono: %s %q contains a control character", f.name, f.value)
+		}
+	}
+	return nil
 }
 
 // writeJSON writes v to path with mode 600. It writes a new file and

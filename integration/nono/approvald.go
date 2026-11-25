@@ -69,17 +69,21 @@ func Approvald(args []string, stdout, stderr io.Writer) int {
 }
 
 // loadScope reads a scope file: the lists targets and paths, nothing else.
+// The decoder alone would also take TARGETS for targets, so every key the
+// file holds is checked as spelt.
 func loadScope(path string) (scope.Scope, error) {
 	var file struct {
-		Targets []string
-		Paths   []string
+		Targets []string `toml:"targets"`
+		Paths   []string `toml:"paths"`
 	}
 	meta, err := toml.DecodeFile(path, &file)
 	if err != nil {
 		return scope.Scope{}, err
 	}
-	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
-		return scope.Scope{}, fmt.Errorf("%s: unknown key %q", path, undecoded[0].String())
+	for _, key := range meta.Keys() {
+		if len(key) != 1 || (key[0] != "targets" && key[0] != "paths") {
+			return scope.Scope{}, fmt.Errorf("%s: unknown key %q", path, key.String())
+		}
 	}
 	s, err := scope.New(file.Targets, file.Paths)
 	if err != nil {
@@ -123,7 +127,14 @@ func (p *printer) denial(denial map[string]any) {
 	p.print(record)
 }
 
+// print writes record as one line, with every text cut to maxRecordText
+// characters.
 func (p *printer) print(record map[string]any) {
+	for k, v := range record {
+		if text, ok := v.(string); ok {
+			record[k] = cut(text)
+		}
+	}
 	record["ts"] = time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	line, _ := json.Marshal(record) // strings and numbers only: it cannot fail
 	p.mu.Lock()

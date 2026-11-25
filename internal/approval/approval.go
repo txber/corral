@@ -10,7 +10,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/txber/corral/integration"
 	"github.com/txber/corral/internal/scope"
@@ -31,7 +33,7 @@ func Decide(r integration.Request, s scope.Scope, resolve func(string) (string, 
 	case "network":
 		return decideNetwork(r, s)
 	default:
-		return deny("request kind %.200q is not decided automatically", r.Kind)
+		return deny("request kind %s is not decided automatically", quote(r.Kind, 200))
 	}
 }
 
@@ -40,10 +42,10 @@ func decidePath(path string, s scope.Scope, resolve func(string) (string, error)
 	// A relative path is denied before it is resolved, so that it can never be
 	// read against the supervisor's own working folder.
 	if !filepath.IsAbs(path) {
-		return deny("path %.200q is not absolute", path)
+		return deny("path %s is not absolute", quote(path, 200))
 	}
 	if strings.ContainsRune(path, 0) {
-		return deny("path %.200q contains a NUL byte", path)
+		return deny("path %s contains a NUL byte", quote(path, 200))
 	}
 	resolved, err := resolve(path)
 	if err != nil {
@@ -53,35 +55,53 @@ func decidePath(path string, s scope.Scope, resolve func(string) (string, error)
 		if errors.As(err, &pathErr) {
 			err = pathErr.Err
 		}
-		return deny("cannot resolve path %.200q: %.150q", path, err)
+		return deny("cannot resolve path %s: %s", quote(path, 200), quote(err.Error(), 150))
 	}
 	if !s.AllowsPath(resolved) {
-		return deny("%.200q is outside the scope", resolved)
+		return deny("%s is outside the scope", quote(resolved, 200))
 	}
-	return integration.Decision{Decision: "granted", Reason: fmt.Sprintf("%.200q is inside the scope", resolved)}
+	return integration.Decision{Decision: "granted", Reason: fmt.Sprintf("%s is inside the scope", quote(resolved, 200))}
 }
 
 // decideNetwork checks every address as tcp, whatever protocol the agent
 // meant: the scope's udp targets are not for agents to ask about.
 func decideNetwork(r integration.Request, s scope.Scope) integration.Decision {
 	if len(r.Addresses) == 0 {
-		return deny("no resolved addresses for host %.200q", r.Host)
+		return deny("no resolved addresses for host %s", quote(r.Host, 200))
 	}
 	for _, addr := range r.Addresses {
 		if !s.AllowsTarget(addr, "tcp", r.Port) {
-			return deny("%.200q on tcp port %d is outside the scope", addr, r.Port)
+			return deny("%s on tcp port %d is outside the scope", quote(addr, 200), r.Port)
 		}
 	}
 	return integration.Decision{
 		Decision: "grant_session",
-		Reason:   fmt.Sprintf("all %d addresses of host %.200q are inside the scope on tcp port %d", len(r.Addresses), r.Host, r.Port),
+		Reason:   fmt.Sprintf("all %d addresses of host %s are inside the scope on tcp port %d", len(r.Addresses), quote(r.Host, 200), r.Port),
 	}
 }
 
-// deny builds a denial. Every request-supplied text in a reason is cut to
-// 200 characters (%.200q), because reasons go into the event log.
+// deny builds a denial. Reasons go into the event log, so every
+// request-supplied text in one is quoted and cut (quote): a reason is at
+// most 400 bytes.
 func deny(format string, args ...any) integration.Decision {
 	return integration.Decision{Decision: "denied", Reason: fmt.Sprintf(format, args...)}
+}
+
+// quote is text quoted as %q does, cut so that the quoted form is at most
+// limit bytes. A rune that is not printable is escaped to up to ten bytes,
+// so cutting the text to limit characters alone would not bound it.
+func quote(text string, limit int) string {
+	end, size := 0, len(`""`)
+	for end < len(text) {
+		_, n := utf8.DecodeRuneInString(text[end:])
+		escaped := len(strconv.Quote(text[end:end+n])) - len(`""`)
+		if size+escaped > limit {
+			break
+		}
+		size += escaped
+		end += n
+	}
+	return strconv.Quote(text[:end])
 }
 
 // Realpath returns the location an absolute path names once every symbolic

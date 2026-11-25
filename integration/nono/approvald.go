@@ -49,12 +49,10 @@ func Approvald(args []string, stdout, stderr io.Writer) int {
 	}
 
 	out := &printer{w: stdout}
-	decide := func(r integration.Request) integration.Decision {
-		d := approval.Decide(r, s, nil)
-		out.decision(r, d)
-		return d
-	}
-	srv, err := serve(*socket, decide, out.denial)
+	decide := func(r integration.Request) integration.Decision { return approval.Decide(r, s, nil) }
+	// A decision is printed once it has reached the sandbox, never before:
+	// one that comes too late is replaced by the server's denial.
+	srv, err := serveWithSent(*socket, decide, out.denial, out.decision)
 	if err != nil {
 		fmt.Fprintf(stderr, "corral approvald: %v\n", err)
 		return 1

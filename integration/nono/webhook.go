@@ -50,7 +50,8 @@ type server struct {
 	socket   os.FileInfo // the socket file as bound, to remove only that one
 	decide   func(integration.Request) integration.Decision
 	report   func(map[string]any)
-	done     chan struct{} // closed by Close
+	sent     func(integration.Request, integration.Decision) // may be nil
+	done     chan struct{}                                   // closed by Close
 
 	mu     sync.Mutex
 	conns  map[net.Conn]bool
@@ -69,6 +70,13 @@ type server struct {
 // that a server still answers on, and anything that is not a socket, is
 // refused.
 func serve(socketPath string, decide func(integration.Request) integration.Decision, report func(map[string]any)) (*server, error) {
+	return serveWithSent(socketPath, decide, report, nil)
+}
+
+// serveWithSent is serve that also calls sent with each decision of decide
+// once its answer has been written to the client, so that a record of it
+// never shows an answer the sandbox did not get. sent may be nil.
+func serveWithSent(socketPath string, decide func(integration.Request) integration.Decision, report func(map[string]any), sent func(integration.Request, integration.Decision)) (*server, error) {
 	if err := removeStale(socketPath); err != nil {
 		return nil, err
 	}
@@ -87,6 +95,7 @@ func serve(socketPath string, decide func(integration.Request) integration.Decis
 		socket:   info,
 		decide:   decide,
 		report:   report,
+		sent:     sent,
 		done:     make(chan struct{}),
 		conns:    map[net.Conn]bool{},
 	}
@@ -218,10 +227,11 @@ func reject(status int, format string, args ...any) *rejection {
 	return &rejection{status: status, reason: fmt.Sprintf(format, args...)}
 }
 
-// handle answers the one request on conn.
+// handle answers the first request on conn and closes it. Anything the
+// client sends after that request, such as a second one, is not read.
 func (s *server) handle(conn net.Conn) {
 	defer conn.Close()
-	decision, err := s.answer(conn)
+	request, decision, err := s.answer(conn)
 	status, extra := http.StatusOK, ""
 	if err != nil {
 		var r *rejection
@@ -242,7 +252,10 @@ func (s *server) handle(conn net.Conn) {
 	head := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n%s\r\n",
 		status, http.StatusText(status), len(body), extra)
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	_, _ = conn.Write(append([]byte(head), body...))
+	_, writeErr := conn.Write(append([]byte(head), body...))
+	if err == nil && writeErr == nil && s.sent != nil {
+		s.sent(request, decision)
+	}
 }
 
 // reportDenial passes a denial to report. A report that panics loses its
@@ -261,47 +274,51 @@ func (s *server) reportDenial(r *rejection) {
 }
 
 // answer reads one request from conn and decides it. An error that is not
-// a *rejection means there is nobody to answer.
-func (s *server) answer(conn net.Conn) (integration.Decision, error) {
+// a *rejection means there is nobody to answer: the client closed the
+// connection without sending anything, or the server is closing.
+func (s *server) answer(conn net.Conn) (integration.Request, integration.Decision, error) {
 	var none integration.Decision
+	var nothing integration.Request
 	_ = conn.SetReadDeadline(time.Now().Add(receiveTimeout))
 	limited := &io.LimitedReader{R: conn, N: maxHeaderBytes}
 	req, err := http.ReadRequest(bufio.NewReader(limited))
 	if err != nil {
 		if limited.N == 0 && !isTimeout(err) {
-			return none, reject(http.StatusRequestHeaderFieldsTooLarge, "headers larger than %d bytes", maxHeaderBytes)
+			return nothing, none, reject(http.StatusRequestHeaderFieldsTooLarge, "headers larger than %d bytes", maxHeaderBytes)
 		}
-		return none, readError(err)
+		return nothing, none, readError(err)
 	}
 	if err := checkRequest(req); err != nil {
-		return none, err
+		return nothing, none, err
 	}
 	// The body follows the headers; checkRequest has bounded its length.
 	limited.N = maxBodyBytes
 	body := make([]byte, req.ContentLength)
 	if _, err := io.ReadFull(req.Body, body); err != nil {
-		return none, readError(err)
+		return nothing, none, readError(err)
 	}
 	request, context, err := parseBody(body)
 	if err != nil {
-		return none, err
+		return nothing, none, err
 	}
 	budget := handlerBudget(req.Header.Get("X-Nono-Timeout-Secs"))
-	return s.decideWithin(request, budget, context)
+	decision, err := s.decideWithin(request, budget, context)
+	return request, decision, err
 }
 
 func isTimeout(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }
 
-// readError turns a failed read into a rejection, or into a plain error
-// when the client went away.
+// readError turns a failed read into a rejection: a request that is late,
+// incomplete or malformed is a reported denial. Only a read cut off by
+// Close is a plain error.
 func readError(err error) error {
 	switch {
 	case isTimeout(err):
 		return reject(http.StatusRequestTimeout, "request not received within %v", receiveTimeout)
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, syscall.ECONNRESET), errors.Is(err, net.ErrClosed):
+	case errors.Is(err, net.ErrClosed):
 		return err
 	}
-	return reject(http.StatusBadRequest, "malformed request: %.200v", err)
+	return reject(http.StatusBadRequest, "incomplete or malformed request: %.200v", err)
 }
 
 // checkRequest accepts only what nono sends: POST / over HTTP/1 with a
@@ -387,6 +404,7 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 		Access      *string   `json:"access"`
 		Host        *string   `json:"host"`
 		Port        *int      `json:"port"`
+		Protocol    *string   `json:"protocol"`
 		ResolvedIPs *[]string `json:"resolved_ips"`
 	}
 	var head struct {
@@ -421,6 +439,10 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 		}
 		if fields.Host == nil || fields.Port == nil || fields.ResolvedIPs == nil {
 			return integration.Request{}, errors.New("network request needs host, port and resolved_ips")
+		}
+		// The scope is checked for tcp; nono's proxy only asks about tcp.
+		if fields.Protocol != nil && *fields.Protocol != "tcp" {
+			return integration.Request{}, fmt.Errorf("network request protocol %.20q is not tcp", *fields.Protocol)
 		}
 		if *fields.Port < 1 || *fields.Port > 65535 {
 			return integration.Request{}, fmt.Errorf("network request port %d is out of range", *fields.Port)

@@ -2,6 +2,7 @@ package nono
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -148,12 +149,12 @@ func TestWrapPutsTheCommandAfterADoubleDash(t *testing.T) {
 	command := []string{"/usr/local/lib/pi/pi", "--mode", "rpc"}
 	argv := newSandbox(t).Wrap(a, command)
 	want := []string{
-		binary, "run", "--silent", "--sandbox-policy", "external",
-		"--name", "a1",
-		"--profile", filepath.Join(a.StateDir, "sandbox.json"),
-		"--allow", "/home/you/work/a1",
-		"--memory", "2G",
-		"--max-processes", "256",
+		binary, "run", "--silent", "--sandbox-policy=external",
+		"--name=a1",
+		"--profile=" + filepath.Join(a.StateDir, "sandbox.json"),
+		"--allow=/home/you/work/a1",
+		"--memory=2G",
+		"--max-processes=256",
 		"--", "/usr/local/lib/pi/pi", "--mode", "rpc",
 	}
 	if !slices.Equal(argv, want) {
@@ -163,9 +164,9 @@ func TestWrapPutsTheCommandAfterADoubleDash(t *testing.T) {
 
 func TestWrapUsesExternalPolicyOnlyForDirectNetwork(t *testing.T) {
 	s := newSandbox(t)
-	for _, network := range []string{"direct", "proxy", "none"} {
+	for _, network := range []string{"direct", "none"} {
 		argv := s.Wrap(sampleAgent(t, network), []string{"true"})
-		external := strings.Contains(strings.Join(argv, " "), "--sandbox-policy external")
+		external := strings.Contains(strings.Join(argv, " "), "--sandbox-policy=external")
 		if external != (network == "direct") {
 			t.Errorf("network %q: Wrap = %q; external policy %v, want %v", network, argv, external, network == "direct")
 		}
@@ -177,7 +178,7 @@ func TestWrapLeavesOutLimitsThatAreUnset(t *testing.T) {
 	a.Limits = integration.Limits{}
 	argv := newSandbox(t).Wrap(a, []string{"true"})
 	for _, flag := range []string{"--memory", "--max-processes"} {
-		if slices.Contains(argv, flag) {
+		if strings.Contains(strings.Join(argv, " "), flag) {
 			t.Errorf("Wrap = %q, want no %s", argv, flag)
 		}
 	}
@@ -226,8 +227,8 @@ func TestModeNoneWrapFixesTheProxyPortAndKeepsNonosNetworkLock(t *testing.T) {
 	a := sampleAgent(t, "none")
 	argv := newSandbox(t).Wrap(a, []string{"true"})
 	line := strings.Join(argv, " ")
-	if !strings.Contains(line, "--proxy-port 18007 ") {
-		t.Errorf("Wrap = %q, want --proxy-port 18007", argv)
+	if !slices.Contains(argv, "--proxy-port=18007") {
+		t.Errorf("Wrap = %q, want --proxy-port=18007", argv)
 	}
 	if strings.Contains(line, "--sandbox-policy") {
 		t.Errorf("Wrap = %q, want no --sandbox-policy", argv)
@@ -248,12 +249,40 @@ func TestModeNoneNeedsAProxyPortAndAnAbsoluteKeyFile(t *testing.T) {
 	}
 }
 
-func TestModeDirectProfileHasNoNetworkSection(t *testing.T) {
-	for _, network := range []string{"direct", "proxy"} {
-		profile := prepared(t, sampleAgent(t, network), nil)
-		if n, ok := profile["network"]; ok {
-			t.Errorf("network %q: profile has a network section: %v", network, n)
+func TestOnlyModesNoneAndDirectArePrepared(t *testing.T) {
+	s, p := newSandbox(t), newKeyProxy(t)
+	for _, network := range []string{"proxy", "", "open"} {
+		a := sampleAgent(t, network)
+		err := s.Prepare(a, nil)
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q", network)) {
+			t.Errorf("sandbox Prepare in mode %q = %v, want an error naming the mode", network, err)
 		}
+		if _, statErr := os.Stat(filepath.Join(a.StateDir, "sandbox.json")); statErr == nil {
+			t.Errorf("mode %q: a profile was written", network)
+		}
+	}
+	// The key proxy serves only mode direct; in mode none the sandbox
+	// serves the gateway itself.
+	for _, network := range []string{"none", "proxy", ""} {
+		a := sampleAgent(t, network)
+		err := p.Prepare(a, a.Gateway, netip.MustParseAddrPort("198.18.7.1:18007"))
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q", network)) {
+			t.Errorf("key proxy Prepare in mode %q = %v, want an error naming the mode", network, err)
+		}
+	}
+}
+
+func TestWrapBlocksTheNetworkInAModePrepareRefuses(t *testing.T) {
+	argv := newSandbox(t).Wrap(sampleAgent(t, "proxy"), []string{"true"})
+	if !slices.Contains(argv, "--block-net") || strings.Contains(strings.Join(argv, " "), "--sandbox-policy") {
+		t.Errorf("Wrap = %q, want --block-net and no --sandbox-policy", argv)
+	}
+}
+
+func TestModeDirectProfileHasNoNetworkSection(t *testing.T) {
+	profile := prepared(t, sampleAgent(t, "direct"), nil)
+	if n, ok := profile["network"]; ok {
+		t.Errorf("profile has a network section: %v", n)
 	}
 }
 
@@ -297,8 +326,8 @@ func TestProxyCommandKeepsTheTokenOutOfTheArguments(t *testing.T) {
 	listen := netip.MustParseAddrPort("198.18.7.1:18007")
 	argv, env := newKeyProxy(t).Command(a, a.Gateway, listen)
 	want := []string{
-		binary, "proxy", "--listen", "198.18.7.1", "--port", "18007",
-		"--profile", filepath.Join(a.StateDir, "proxy.json"),
+		binary, "proxy", "--listen=198.18.7.1", "--port=18007",
+		"--profile=" + filepath.Join(a.StateDir, "proxy.json"),
 	}
 	if !slices.Equal(argv, want) {
 		t.Errorf("argv = %q, want %q", argv, want)

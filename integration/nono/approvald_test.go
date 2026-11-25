@@ -9,9 +9,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/txber/corral/integration"
 )
 
 // TestMain lets the test binary stand in for the corral binary: started
@@ -160,5 +163,54 @@ func TestApprovaldRefusesABadCommandLineOrScope(t *testing.T) {
 		if stdout.Len() != 0 || stderr.Len() == 0 {
 			t.Errorf("Approvald(%q): stdout %q, stderr %q; want only a message on stderr", args, stdout.String(), stderr.String())
 		}
+	}
+}
+
+// lockedBuffer is a bytes.Buffer that the test may read while the server
+// writes to it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestADecisionTooLateToBeSentIsNotPrinted(t *testing.T) {
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	slow := func(integration.Request) integration.Decision {
+		defer close(finished)
+		<-release
+		return integration.Decision{Decision: "granted", Reason: "too late"}
+	}
+	var out lockedBuffer
+	p := &printer{w: &out}
+	path := socketPath(t)
+	s, err := serveWithSent(path, slow, p.denial, p.decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// nono waits 2 s, so the deadline is already over.
+	answer := exchange(t, path, post(t, capability, 2))
+	close(release)
+	<-finished
+	time.Sleep(100 * time.Millisecond) // a wrong print would come now
+	if answer.body["decision"] != "denied" {
+		t.Errorf("answer = %v, want a denial", answer.body)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], `"decision":"denied"`) {
+		t.Errorf("printed %q, want exactly one line, the denial", lines)
 	}
 }

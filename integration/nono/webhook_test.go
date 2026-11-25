@@ -410,6 +410,11 @@ func TestEveryServerMadeDenialIsReportedOnce(t *testing.T) {
 			return fmt.Appendf(nil, "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n", 1024*1024+1)
 		}, false, 413},
 		{"headers too large", func(*testing.T) []byte { return []byte(big) }, false, 431},
+		{"unknown path", func(*testing.T) []byte { return []byte("POST /x HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}") }, false, 404},
+		{"chunked body", func(*testing.T) []byte {
+			return []byte("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n")
+		}, false, 501},
+		{"HTTP/2", func(*testing.T) []byte { return []byte("POST / HTTP/2.0\r\nContent-Length: 2\r\n\r\n{}") }, false, 505},
 		{"no length", func(*testing.T) []byte { return []byte("POST / HTTP/1.1\r\nHost: localhost\r\n\r\n{}") }, false, 411},
 		{"slow client", func(*testing.T) []byte { return []byte("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n{}") }, false, 408},
 		{"slow decide", func(t *testing.T) []byte { return post(t, capability, 2) }, true, 200},
@@ -542,6 +547,8 @@ func TestParseRequestRefusesWhatItCannotRead(t *testing.T) {
 		`{"capability_type": "network", "host": "h", "port": 70000, "resolved_ips": []}`,
 		`{"capability_type": "network", "host": "h", "port": 80}`,
 		`{"capability_type": "network", "port": 80, "resolved_ips": []}`,
+		`{"capability_type": "network", "host": "h", "port": 53, "protocol": "udp", "resolved_ips": []}`,
+		`{"capability_type": "network", "host": "h", "port": 53, "protocol": 6, "resolved_ips": []}`,
 	} {
 		if got, err := parseRequest(json.RawMessage(raw)); err == nil {
 			t.Errorf("parseRequest(%s) = %+v, want an error", raw, got)
@@ -567,5 +574,43 @@ func TestParseRequestReadsTheToolsOwnBodies(t *testing.T) {
 	want = integration.Request{Kind: "network", ID: "4cc5a503-939c-4f6f-bf2d-b0aea3a28a53", Host: "example.com", Port: 443, Addresses: []string{}}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Errorf("network request: parseRequest = %+v, %v; want %+v", got, err, want)
+	}
+}
+
+func TestRequestThatEndsEarlyIsAReportedDenial(t *testing.T) {
+	for name, data := range map[string]string{
+		"body cut short":    "POST / HTTP/1.1\r\nContent-Length: 20\r\n\r\n{\"backend\"",
+		"headers cut short": "POST / HTTP/1.1\r\nContent-Length: 2\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got reports
+			path := serving(t, granting, got.add)
+			conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			// The client sends part of a request and says it will send no more.
+			if _, err := conn.Write([]byte(data)); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("no answer: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 400 {
+				t.Errorf("status = %d, want 400", resp.StatusCode)
+			}
+			if list := got.all(); len(list) != 1 || list[0]["status"] != 400 {
+				t.Errorf("reports = %v, want one with status 400", list)
+			}
+		})
 	}
 }

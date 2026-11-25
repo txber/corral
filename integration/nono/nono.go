@@ -151,9 +151,13 @@ func (s sandbox) Prepare(a integration.Agent, readPaths []string) error {
 // sandboxProfile is the profile for one agent. File requests outside it
 // go to the approval endpoint on the agent's socket. In network mode
 // "none" the sandbox also serves the gateway and asks the same endpoint
-// about every other host; in the other modes the network is confined
-// from outside and the profile says nothing about it.
+// about every other host; in mode "direct" the network is confined from
+// outside and the profile says nothing about it. Any other mode is
+// refused, because the profile alone would leave the network open.
 func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
+	if a.Network != "none" && a.Network != "direct" {
+		return profile{}, fmt.Errorf("nono: network mode %q is not supported, only \"none\" and \"direct\"", a.Network)
+	}
 	if !filepath.IsAbs(a.StateDir) {
 		return profile{}, fmt.Errorf("nono: state folder %q is not absolute", a.StateDir)
 	}
@@ -176,7 +180,7 @@ func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
 		},
 		Filesystem: &filesystemSection{Read: readPaths, Deny: a.Deny},
 	}
-	if a.Network != "none" {
+	if a.Network == "direct" {
 		return p, nil
 	}
 	if a.ProxyPort < 1 || a.ProxyPort > 65535 {
@@ -225,28 +229,36 @@ func gatewayNetwork(g integration.Gateway, envVar string) (networkSection, error
 	}, nil
 }
 
-// Wrap returns the command line that runs command in the sandbox.
+// Wrap returns the command line that runs command in the sandbox. Every
+// value is joined to its option with "=", so that a value starting with
+// "-" cannot be read as another option.
 func (s sandbox) Wrap(a integration.Agent, command []string) []string {
 	argv := []string{s.binary, "run", "--silent"}
-	if a.Network == "direct" {
+	switch a.Network {
+	case "direct":
 		// The agent's namespace and firewall confine the network; nono's
 		// own TCP lock would block the addresses the agent was given.
-		argv = append(argv, "--sandbox-policy", "external")
+		argv = append(argv, "--sandbox-policy=external")
+	case "none":
+	default:
+		// Prepare refuses this mode first; should the command still be run,
+		// it gets no network at all rather than an open one.
+		argv = append(argv, "--block-net")
 	}
 	argv = append(argv,
-		"--name", a.ID,
-		"--profile", filepath.Join(a.StateDir, sandboxProfileFile),
-		"--allow", a.Workdir,
+		"--name="+a.ID,
+		"--profile="+filepath.Join(a.StateDir, sandboxProfileFile),
+		"--allow="+a.Workdir,
 	)
 	if a.Limits.Memory != "" {
-		argv = append(argv, "--memory", a.Limits.Memory)
+		argv = append(argv, "--memory="+a.Limits.Memory)
 	}
 	if a.Limits.MaxProcesses > 0 {
-		argv = append(argv, "--max-processes", strconv.Itoa(a.Limits.MaxProcesses))
+		argv = append(argv, "--max-processes="+strconv.Itoa(a.Limits.MaxProcesses))
 	}
 	if a.Network == "none" {
 		// The gateway is served at http://127.0.0.1:<ProxyPort>/<name>.
-		argv = append(argv, "--proxy-port", strconv.Itoa(a.ProxyPort))
+		argv = append(argv, "--proxy-port="+strconv.Itoa(a.ProxyPort))
 	}
 	argv = append(argv, "--")
 	return append(argv, command...)
@@ -266,14 +278,21 @@ func (s sandbox) StopCommand(a integration.Agent) []string {
 	return []string{s.binary, "stop", a.ID}
 }
 
-// AuditPath is empty: corral does not read nono's own audit log yet.
+// AuditPath is empty: nono keeps a session's audit record in a folder
+// named after a session id it picks itself, not after the name given with
+// --name, so the path is not known from the agent.
 func (s sandbox) AuditPath(integration.Agent) string { return "" }
 
 // keyProxy serves the gateway with `nono proxy`.
 type keyProxy struct{ binary string }
 
-// Prepare writes the proxy's profile to <StateDir>/proxy.json.
+// Prepare writes the proxy's profile to <StateDir>/proxy.json. The proxy
+// serves only network mode "direct": in mode "none" the sandbox serves the
+// gateway itself.
 func (k keyProxy) Prepare(a integration.Agent, g integration.Gateway, _ netip.AddrPort) error {
+	if a.Network != "direct" {
+		return fmt.Errorf("nono: the key proxy serves only network mode \"direct\", not %q", a.Network)
+	}
 	p, err := proxyProfile(g)
 	if err != nil {
 		return err
@@ -291,13 +310,14 @@ func proxyProfile(g integration.Gateway) (profile, error) {
 }
 
 // Command starts the proxy on listen. The stand-in token the agent must
-// present goes into the environment, never into the arguments.
+// present goes into the environment, never into the arguments; the other
+// values are joined to their options with "=", as in Wrap.
 func (k keyProxy) Command(a integration.Agent, g integration.Gateway, listen netip.AddrPort) (argv, env []string) {
 	argv = []string{
 		k.binary, "proxy",
-		"--listen", listen.Addr().String(),
-		"--port", strconv.Itoa(int(listen.Port())),
-		"--profile", filepath.Join(a.StateDir, proxyProfileFile),
+		"--listen=" + listen.Addr().String(),
+		"--port=" + strconv.Itoa(int(listen.Port())),
+		"--profile=" + filepath.Join(a.StateDir, proxyProfileFile),
 	}
 	return argv, []string{"NONO_PROXY_PASS=" + a.GatewayToken}
 }

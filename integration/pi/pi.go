@@ -166,7 +166,8 @@ type (
 // configuration, <ShareDir>/pi/models.json with the one provider "gateway",
 // goes where the agent can read but not change it, because it names the
 // model and its price. Home, temporary files and the session transcript go
-// below the working folder. Corral calls Prepare before Command and Env.
+// below the working folder. Both Workdir and ShareDir must exist; Prepare
+// refuses a missing one. Corral calls Prepare before Command and Env.
 func (p *program) Prepare(a integration.Agent) error {
 	thinking, _, err := roleOptions(a.Options)
 	if err != nil {
@@ -468,11 +469,15 @@ func decodeTool(typ string, rec map[string]any) *integration.Record {
 // plainFields returns the strings, numbers and booleans of a record except
 // its type, leaving out nested messages and results. It keeps the first
 // maxFields of them in key order and marks the record "truncated" when it
-// left some out.
+// left some out. Keys named like the marks "truncated" and "usage_refused"
+// are left out, so that a mark always comes from this package.
 func plainFields(rec map[string]any) map[string]any {
 	fields := map[string]any{}
 	kept := 0
 	for _, key := range sortedKeys(rec) {
+		if key == "truncated" || key == "usage_refused" {
+			continue
+		}
 		var value any
 		switch v := rec[key].(type) {
 		case string:
@@ -565,12 +570,10 @@ func number(obj map[string]any, key string, limit float64) (float64, bool) {
 // cut returns the first maxText characters of s, with every control
 // character replaced by U+FFFD so that nothing printing the text can be
 // steered by it. It looks at no more than the bytes maxText characters can
-// take, and never splits a character.
+// take; a character split at that limit lies past the maxText-th one, and
+// broken bytes become U+FFFD like control characters.
 func cut(s string) string {
 	if limit := maxText * utf8.UTFMax; len(s) > limit {
-		for limit > 0 && !utf8.RuneStart(s[limit]) {
-			limit--
-		}
 		s = s[:limit]
 	}
 	var b strings.Builder

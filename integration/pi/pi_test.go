@@ -747,6 +747,25 @@ func TestCutNeverSplitsACharacter(t *testing.T) {
 	}
 }
 
+func TestCutKeepsTextMadeOfBrokenBytes(t *testing.T) {
+	got := cut("a" + strings.Repeat("\x80", 900))
+	if n := utf8.RuneCountInString(got); n == 0 || n > 200 {
+		t.Errorf("cut gave %d characters, want between 1 and 200", n)
+	}
+}
+
+func TestDecodeLeavesOutTheLinesOwnMarks(t *testing.T) {
+	r := decode(t, `{"type":"compaction_end","reason":"threshold","truncated":true,"usage_refused":true,"result":{"usage":{"input":10,"output":2,"cost":{"total":0.01}}}}`)
+	if r == nil || r.Usage == nil {
+		t.Fatalf("Decode = %+v, want a Usage", r)
+	}
+	for _, mark := range []string{"truncated", "usage_refused"} {
+		if _, ok := r.Fields[mark]; ok {
+			t.Errorf("Fields = %v, want no %s", r.Fields, mark)
+		}
+	}
+}
+
 func TestPrepareRefusesALinkedFolderInTheWorkFolder(t *testing.T) {
 	rt := newTestRuntime(t, nil)
 	a := testAgent(t)

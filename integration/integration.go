@@ -77,9 +77,9 @@ type Agent struct {
 	Model        string
 	Options      map[string]any // the role's free-form options, meant for the runtime
 	Cost         Cost
-	Workdir      string // the only folder the agent may write
+	Workdir      string // the only folder the agent may write; exists when Prepare is called
 	StateDir     string // private to the supervisor; integrations put generated files here
-	ShareDir     string // a folder the agent may read but not write; integrations put there what the agent program must read
+	ShareDir     string // a folder the agent may read but not write; integrations put there what the agent program must read; exists when Prepare is called
 	Limits       Limits
 	Deny         []string // folders the agent must never read
 	Gateway      Gateway  // the model gateway this agent uses

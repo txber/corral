@@ -52,6 +52,8 @@ const usage = `usage:
   corral netns exec  <agent_id> --env-file <path> -- <command> [<arg>...]
   corral netns down  <agent_id> <slot>
   corral netns list
+  corral netns enter --env-file <path> -- <command> [<arg>...]
+      (the second half of exec, run by it; not meant to be called directly)
 
 <agent_id> is a lowercase letter and up to 11 lowercase letters or digits,
 <slot> a number from 1 to 250, and <target> <ip[/prefix]>:<tcp|udp>:<port[-port]>,
@@ -253,8 +255,8 @@ type command struct {
 	agentID string
 	slot    int
 	targets []Target
-	envFile string   // exec only
-	argv    []string // exec only: the command to run and its arguments
+	envFile string   // exec and enter only
+	argv    []string // exec and enter only: the command to run and its arguments
 }
 
 // parseArgs checks a whole command line; nothing may run before it passes.
@@ -274,6 +276,8 @@ func parseArgs(args []string) (command, error) {
 		return command{name: name}, nil
 	case "exec":
 		return parseExec(rest)
+	case "enter":
+		return parseLaunch(name, rest)
 	case "up", "allow", "down":
 	default:
 		return command{}, fmt.Errorf("unknown command %.40q", name)
@@ -332,21 +336,31 @@ func parseTargets(args []string) ([]Target, error) {
 }
 
 // parseExec reads "<agent_id> --env-file <path> -- <command> [<arg>...]".
-// The command's own arguments are passed on as they are; only NUL bytes,
-// which no argument can carry, are refused.
 func parseExec(args []string) (command, error) {
-	if len(args) < 5 || args[1] != "--env-file" || args[3] != "--" {
+	if len(args) < 1 {
 		return command{}, errors.New("exec needs <agent_id> --env-file <path> -- <command> [<arg>...]")
 	}
 	agentID, err := parseAgentID(args[0])
 	if err != nil {
 		return command{}, err
 	}
-	envFile := args[2]
+	c, err := parseLaunch("exec", args[1:])
+	c.agentID = agentID
+	return c, err
+}
+
+// parseLaunch reads "--env-file <path> -- <command> [<arg>...]", the part
+// exec and enter share. The command's own arguments are passed on as they
+// are; only NUL bytes, which no argument can carry, are refused.
+func parseLaunch(name string, args []string) (command, error) {
+	if len(args) < 4 || args[0] != "--env-file" || args[2] != "--" {
+		return command{}, fmt.Errorf("%s needs --env-file <path> -- <command> [<arg>...]", name)
+	}
+	envFile := args[1]
 	if !strings.HasPrefix(envFile, "/") || strings.Contains(envFile, "\x00") || hasDotDot(envFile) {
 		return command{}, fmt.Errorf("bad --env-file %.80q: want an absolute path without ..", envFile)
 	}
-	argv := args[4:]
+	argv := args[3:]
 	if argv[0] == "" || strings.HasPrefix(argv[0], "-") {
 		return command{}, fmt.Errorf("bad command %.80q", argv[0])
 	}
@@ -355,7 +369,7 @@ func parseExec(args []string) (command, error) {
 			return command{}, errors.New("command argument holds a NUL byte")
 		}
 	}
-	return command{name: "exec", agentID: agentID, envFile: envFile, argv: argv}, nil
+	return command{name: name, envFile: envFile, argv: argv}, nil
 }
 
 // hasDotDot reports whether path has a ".." element.

@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -45,6 +44,8 @@ func execute(c command, stdout io.Writer) error {
 		return down(c.agentID, c.slot)
 	case "exec":
 		return execInside(c.agentID, c.envFile, c.argv)
+	case "enter":
+		return enter(c.envFile, c.argv)
 	case "list":
 		return list(stdout)
 	}
@@ -96,12 +97,10 @@ func up(agentID string, slot int, targets []Target) (err error) {
 	}
 	defer onFailure(&err, func() error { return ip("link", "delete", n.Veth) })
 
-	// With IPv6 on, link-up sends router solicitations, which the rules
-	// drop and log.
-	if err := disableIPv6("", n.Veth); err != nil {
-		return err
-	}
-	if err := disableIPv6(filepath.Join(netnsDir, n.Netns), "all", "default", "lo", "eth0"); err != nil {
+	// With IPv6 on, the agent's router solicitations reach the rules on a
+	// host that forwards IPv6, which drop and log them. Off on the root end,
+	// the kernel discards them first.
+	if err := disableIPv6(n.Veth); err != nil {
 		return err
 	}
 	if err := ip("addr", "add", n.RootIP+"/30", "dev", n.Veth); err != nil {
@@ -303,22 +302,20 @@ func list(stdout io.Writer) error {
 	return nil
 }
 
-// execInside replaces the helper with the command, run in the agent's
-// namespace as the user who called sudo, without capabilities, and with
-// the env file's variables as its whole environment. As the same process it
-// keeps sudo's place, the caller's cgroup, and its standard streams, and its
-// exit status reaches the caller directly. The variables never appear on a
-// command line.
+// execInside is the first, root half of exec. It enters the agent's
+// namespace and drops to the user who called sudo, without capabilities,
+// and there runs this program's enter command, which reads the env file and
+// starts the command. The env file is not opened here, so no root process
+// ever holds its variables: nsenter and setpriv get only a fixed PATH.
+// Exec replaces the helper, so the command keeps sudo's place, the
+// caller's cgroup and standard streams, and its exit status reaches the
+// caller directly.
 func execInside(agentID, envFile string, argv []string) error {
 	uid, err := callerID("SUDO_UID", os.Getenv("SUDO_UID"))
 	if err != nil {
 		return err
 	}
 	gid, err := callerID("SUDO_GID", os.Getenv("SUDO_GID"))
-	if err != nil {
-		return err
-	}
-	env, err := readEnvFile(envFile, uid)
 	if err != nil {
 		return err
 	}
@@ -333,18 +330,24 @@ func execInside(agentID, envFile string, argv []string) error {
 	if err != nil {
 		return err
 	}
-	line := execCommandLine(nsenter, setpriv, agentID, uid, gid, argv)
-	return fmt.Errorf("starting nsenter: %w", syscall.Exec(nsenter, line, env))
+	// The running binary itself, by the kernel's account, never by PATH.
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	line := execCommandLine(nsenter, setpriv, self, agentID, uid, gid, envFile, argv)
+	return fmt.Errorf("starting nsenter: %w", syscall.Exec(nsenter, line, []string{"PATH=/usr/bin:/bin"}))
 }
 
 // execCommandLine returns the nsenter command line that enters the agent's
 // namespace and has setpriv drop to uid and gid, with the user's groups and
-// no inheritable capabilities, before it runs argv.
-func execCommandLine(nsenter, setpriv, agentID string, uid, gid int, argv []string) []string {
+// no inheritable capabilities, before self runs "netns enter".
+func execCommandLine(nsenter, setpriv, self, agentID string, uid, gid int, envFile string, argv []string) []string {
 	line := []string{
 		nsenter, "--net=" + filepath.Join(netnsDir, netnsPrefix+agentID), "--",
 		setpriv, "--reuid=" + strconv.Itoa(uid), "--regid=" + strconv.Itoa(gid),
 		"--init-groups", "--inh-caps=-all", "--",
+		self, "netns", "enter", "--env-file", envFile, "--",
 	}
 	return append(line, argv...)
 }
@@ -361,55 +364,85 @@ func callerID(name, text string) (int, error) {
 	return int(id), nil
 }
 
-// disableIPv6 switches IPv6 off for interfaces of the namespace at
-// netnsPath, or of the root namespace when netnsPath is empty. It does
-// nothing on a kernel without IPv6.
-//
-// The setting lives in /proc/sys/net, which shows the namespace of the
-// thread that opens it. For another namespace the files are written from
-// a thread of its own that joins that namespace. That thread is never
-// handed back to the Go runtime, which ends it with its goroutine, so no
-// other code ever runs in the agent's namespace.
-func disableIPv6(netnsPath string, interfaces ...string) error {
+// enter is the second, unprivileged half of exec: it reads the env file as
+// the user it runs as and replaces itself with the command, whose whole
+// environment is the file's variables. It refuses to run as root or with
+// any capability, so that it never reads an env file with privileges.
+// Called directly, it only runs a command as oneself.
+func enter(envFile string, argv []string) error {
+	if os.Getuid() == 0 || os.Geteuid() == 0 {
+		return errors.New("refusing to run as root")
+	}
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return err
+	}
+	if hasEffectiveCapabilities(string(status)) {
+		return errors.New("refusing to run with capabilities")
+	}
+	env, err := readEnvFile(envFile, os.Getuid())
+	if err != nil {
+		return err
+	}
+	path, err := commandPath(argv[0], env)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("starting %s: %w", argv[0], syscall.Exec(path, argv, env))
+}
+
+// hasEffectiveCapabilities reports whether the CapEff line of a
+// /proc/<pid>/status text shows any capability. Without the line it
+// answers yes.
+func hasEffectiveCapabilities(status string) bool {
+	for _, line := range strings.Split(status, "\n") {
+		if mask, ok := strings.CutPrefix(line, "CapEff:"); ok {
+			return strings.Trim(strings.TrimSpace(mask), "0") != ""
+		}
+	}
+	return true
+}
+
+// commandPath finds a command the way a shell would, in the PATH of env, or
+// /usr/bin:/bin when env sets none. A name with a slash is taken as it is.
+func commandPath(name string, env []string) (string, error) {
+	if strings.Contains(name, "/") {
+		return name, nil
+	}
+	searchPath := "/usr/bin:/bin"
+	for _, variable := range env {
+		if value, ok := strings.CutPrefix(variable, "PATH="); ok {
+			searchPath = value
+		}
+	}
+	for _, dir := range filepath.SplitList(searchPath) {
+		path := filepath.Join(dir, name)
+		if info, err := os.Stat(path); dir != "" && err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found in PATH", name)
+}
+
+// disableIPv6 switches IPv6 off for an interface of the root namespace. It
+// does nothing on a kernel without IPv6.
+func disableIPv6(iface string) error {
 	if !exists("/proc/sys/net/ipv6") {
 		return nil
 	}
-	write := func() error {
-		for _, name := range interfaces {
-			path := filepath.Join("/proc/sys/net/ipv6/conf", name, "disable_ipv6")
-			file, err := os.OpenFile(path, os.O_WRONLY, 0)
-			if err != nil {
-				return fmt.Errorf("switching IPv6 off: %w", err)
-			}
-			_, err = file.WriteString("1\n")
-			if closeErr := file.Close(); err == nil {
-				err = closeErr
-			}
-			if err != nil {
-				return fmt.Errorf("switching IPv6 off: %w", err)
-			}
-		}
-		return nil
+	path := filepath.Join("/proc/sys/net/ipv6/conf", iface, "disable_ipv6")
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("switching IPv6 off: %w", err)
 	}
-	if netnsPath == "" {
-		return write()
+	_, err = file.WriteString("1\n")
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
 	}
-	result := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread() // never unlocked: see above
-		ns, err := os.Open(netnsPath)
-		if err != nil {
-			result <- err
-			return
-		}
-		defer ns.Close()
-		if _, _, errno := syscall.Syscall(sysSetns, ns.Fd(), syscall.CLONE_NEWNET, 0); errno != 0 {
-			result <- fmt.Errorf("joining %s: %w", netnsPath, errno)
-			return
-		}
-		result <- write()
-	}()
-	return <-result
+	if err != nil {
+		return fmt.Errorf("switching IPv6 off: %w", err)
+	}
+	return nil
 }
 
 // exists reports whether path exists, without following a final symbolic

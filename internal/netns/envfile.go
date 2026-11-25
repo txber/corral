@@ -1,7 +1,8 @@
 // This file reads the env file of "corral netns exec": the variables, and
-// the only variables, the launched command gets. The helper reads it as
-// root on behalf of an unprivileged caller, so it checks the opened file,
-// not the path, and accepts only a small, plain file of the caller's own.
+// the only variables, the launched command gets. It is read by "corral
+// netns enter", after the drop to the calling user, so no root process ever
+// holds the variables. It still checks the opened file, not the path, and
+// accepts only a small, plain file of the user's own.
 package netns
 
 import (
@@ -83,15 +84,12 @@ func parseEnv(data []byte) ([]string, error) {
 	env := make([]string, 0, len(lines))
 	var keys []string
 	for i, line := range lines {
-		key, value, ok := strings.Cut(line, "=")
+		key, _, ok := strings.Cut(line, "=")
 		if !ok || !validEnvKey(key) {
 			return nil, fmt.Errorf("line %d: want KEY=VALUE with a key of letters, digits and underscores", i+1)
 		}
 		if slices.Contains(keys, key) {
 			return nil, fmt.Errorf("line %d: %s is set twice", i+1, key)
-		}
-		if unsafeForRoot(key, value) {
-			return nil, fmt.Errorf("line %d: %s is not allowed, because the tools that launch the command run as root with it", i+1, key)
 		}
 		keys = append(keys, key)
 		env = append(env, line)
@@ -109,31 +107,4 @@ func validEnvKey(key string) bool {
 		}
 	}
 	return true
-}
-
-// unsafeForRoot reports whether a variable would change how nsenter and
-// setpriv behave. Both run as root with the env file's environment until
-// setpriv drops to the caller, and a root process gets none of the
-// protection the C library gives a set-user-ID program. So the helper
-// refuses what that library drops or distrusts in such a program: the
-// dynamic loader's and the allocator's variables, the paths it loads code
-// or data from, and locale names that are paths.
-func unsafeForRoot(key, value string) bool {
-	for _, prefix := range []string{"LD_", "MALLOC_", "GLIBC_"} {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	switch key {
-	case "GCONV_PATH", "GETCONF_DIR", "HOSTALIASES", "LOCALDOMAIN", "LOCPATH",
-		"NIS_PATH", "NLSPATH", "RESOLV_HOST_CONF", "RES_OPTIONS", "TMPDIR", "TZDIR":
-		return true
-	case "LANG", "LANGUAGE":
-		return strings.Contains(value, "/")
-	case "TZ":
-		// A zone name such as Europe/Berlin is fine; a file is not.
-		zone := strings.TrimPrefix(value, ":")
-		return strings.HasPrefix(zone, "/") || strings.Contains(zone, "..")
-	}
-	return strings.HasPrefix(key, "LC_") && strings.Contains(value, "/")
 }

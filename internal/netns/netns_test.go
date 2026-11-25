@@ -151,6 +151,14 @@ func TestCommandsAreParsed(t *testing.T) {
 		t.Errorf("exec = %+v", run)
 	}
 
+	enter, err := parseArgs([]string{"enter", "--env-file", "/run/e", "--", "agent", "-x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enter.envFile != "/run/e" || !slices.Equal(enter.argv, []string{"agent", "-x"}) {
+		t.Errorf("enter = %+v", enter)
+	}
+
 	down, err := parseArgs([]string{"down", "w1", "7"})
 	if err != nil || down.slot != 7 {
 		t.Errorf("down = %+v, %v", down, err)
@@ -185,6 +193,12 @@ func TestBadCommandLinesAreRefused(t *testing.T) {
 		{"exec", "w1", "--env-file", "/run/e", "--", ""},
 		{"exec", "w1", "--env-file", "/run/e", "--", "agent", "a\x00b"},
 		{"exec", "W1", "--env-file", "/run/e", "--", "agent"},
+		{"enter", "w1", "--env-file", "/run/e", "--", "agent"},
+		{"enter", "--env-file", "relative", "--", "agent"},
+		{"enter", "--env-file", "/run/../e", "--", "agent"},
+		{"enter", "--env-file", "/run/e", "agent"},
+		{"enter", "--env-file", "/run/e", "--"},
+		{"enter", "--env-file", "/run/e", "--", "-agent"},
 		{"down", "w1", "7", "8"},
 		{"down", "w1", "7", "--target", "10.10.4.7:udp:53"},
 		{"list", "x"},

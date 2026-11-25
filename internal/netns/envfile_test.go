@@ -27,13 +27,6 @@ func TestParseEnvAcceptsAnEmptyFile(t *testing.T) {
 	}
 }
 
-func TestParseEnvAcceptsZoneNamesAndLocales(t *testing.T) {
-	text := "TZ=Europe/Berlin\nLANG=de_DE.UTF-8\nLC_ALL=C.UTF-8\n"
-	if _, err := parseEnv([]byte(text)); err != nil {
-		t.Errorf("parseEnv(%q): %v", text, err)
-	}
-}
-
 func TestParseEnvRefuses(t *testing.T) {
 	tests := map[string]string{
 		"a line without =":         "PATH\n",
@@ -45,15 +38,6 @@ func TestParseEnvRefuses(t *testing.T) {
 		"a NUL byte":               "A=x\x00y\n",
 		"a key set twice":          "A=x\nA=y\n",
 		"65 lines":                 strings.Repeat("A=x\n", 64) + "B=y\n",
-		"LD_PRELOAD":               "LD_PRELOAD=/home/you/x.so\n",
-		"LD_LIBRARY_PATH":          "LD_LIBRARY_PATH=/home/you\n",
-		"GCONV_PATH":               "GCONV_PATH=/home/you\n",
-		"MALLOC_CHECK_":            "MALLOC_CHECK_=3\n",
-		"GLIBC_TUNABLES":           "GLIBC_TUNABLES=glibc.malloc.check=3\n",
-		"LOCPATH":                  "LOCPATH=/home/you\n",
-		"a locale that is a path":  "LC_ALL=/home/you/locale\n",
-		"LANG as a path":           "LANG=../../home/you\n",
-		"a zone that is a file":    "TZ=:/home/you/zone\n",
 	}
 	for name, text := range tests {
 		if got, err := parseEnv([]byte(text)); err == nil {

@@ -31,8 +31,8 @@ import (
 const (
 	netnsPrefix   = "oc-"
 	vethPrefix    = "ocv"
-	addressPrefix = "198.18." // agentNetwork without its last two bytes
-	agentNetwork  = "198.18.0.0/16"
+	addressPrefix = "198.18."
+	agentNetwork  = addressPrefix + "0.0/16" // every agent address lies in it
 	proxyPortBase = 18000
 )
 
@@ -42,7 +42,7 @@ const (
 	maxSlot    = 250
 	maxTargets = 256
 	minPrefix  = 8  // the widest network a target may name
-	maxIDLen   = 12 // so that "oc-<id>" fits the kernel's 15-byte name limit
+	maxIDLen   = 12 // the id rule: a letter and up to 11 letters or digits
 )
 
 const usage = `usage:
@@ -88,8 +88,8 @@ func (t Target) valid() bool {
 
 // names is every name and address that belongs to one agent.
 type names struct {
-	Netns, Veth, RootIP, AgentIP, Chain, InChain, TCPSet, UDPSet string
-	ProxyPort                                                    int
+	Netns, Veth, RootIP, AgentIP, Chain, InChain, TCPSet, UDPSet, Limit string
+	ProxyPort                                                           int
 }
 
 // namesFor derives an agent's names from a checked agent id and slot. It
@@ -109,6 +109,7 @@ func namesFor(agentID string, slot int) names {
 		InChain:   "i_" + agentID,
 		TCPSet:    "t_" + agentID,
 		UDPSet:    "u_" + agentID,
+		Limit:     "l_" + agentID,
 		ProxyPort: proxyPortBase + slot,
 	}
 }
@@ -276,6 +277,11 @@ func parseArgs(args []string) (command, error) {
 	}
 	targets, err := parseTargets(rest[2:])
 	if err != nil {
+		return command{}, err
+	}
+	// Refuse targets that would make an oversized ruleset now, before
+	// anything is rendered.
+	if _, _, err := setContents(targets); err != nil {
 		return command{}, err
 	}
 	if name == "allow" && len(targets) == 0 {

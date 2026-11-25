@@ -2,16 +2,25 @@
 // so that every change is one transaction that applies whole or not at all.
 //
 // All rules live in table inet corral. Its base chains accept by default and
-// act only on traffic of the agents' veth interfaces (ocv*):
+// act only on traffic of the agents' veth interfaces (ocv*), and on traffic
+// addressed to the agents' range that arrives on any other interface than
+// loopback:
 //
 //	forward      from an agent: jump to that agent's forward chain a_<id>;
 //	             towards an agent: established and related traffic only
-//	input        from an agent: jump to that agent's input chain i_<id>
+//	input        from an agent: jump to that agent's input chain i_<id>;
+//	             to the agents' range from elsewhere: dropped, so that no
+//	             other host, container or VM can use a proxy port
 //	postrouting  agent traffic leaving through another interface is masqueraded
+//
+// Connections this machine makes to its own 198.18.<n>.1 arrive on lo and
+// pass.
 //
 // The jumps go through two maps from interface name to chain. Traffic from
 // an ocv* interface that no map holds is logged and dropped, and each agent
 // chain ends in a log and a drop, so nothing from an agent falls through.
+// Every drop is logged at a limited rate; both chains of one agent share the
+// named limit l_<id>, so one agent writes at most 10 lines a second.
 //
 // Every accept in an agent chain requires the agent's own IPv4 source
 // address, so an agent cannot borrow another agent's address or connections,
@@ -36,11 +45,16 @@ const (
 	agentIfaces = `"ocv*"` // an nftables name pattern
 	forwardMap  = "forward_agents"
 	inputMap    = "input_agents"
-	// Each chain that logs has its own limit, so one agent can write at
-	// most this many lines a second from each hook.
-	logLimit  = "limit rate 10/second"
-	logPrefix = "corral-drop "
+	logRate     = "10/second"
+	logPrefix   = "corral-drop "
+	// maxElements bounds the set elements one agent's targets may become,
+	// and so the size of the text handed to the kernel.
+	maxElements = 4096
 )
+
+// unknownDrop logs, at a limited rate, a packet that belongs to no agent's
+// rules and is about to be dropped.
+const unknownDrop = "limit rate " + logRate + ` log prefix "` + logPrefix + `? "`
 
 // renderBase returns the text that creates table inet corral, its maps and
 // its base chains where they are missing, and sets the base chains' rules.
@@ -71,16 +85,19 @@ func renderBase() string {
 		"\tchain forward {",
 		"\t\ttype filter hook forward priority filter; policy accept;",
 		"\t\tiifname " + agentIfaces + " iifname vmap @" + forwardMap,
-		"\t\tiifname " + agentIfaces + " " + logLimit + ` log prefix "` + logPrefix + `? "`,
+		"\t\tiifname " + agentIfaces + " " + unknownDrop,
 		"\t\tiifname " + agentIfaces + " drop",
 		"\t\toifname " + agentIfaces + " ct state established,related accept",
+		"\t\toifname " + agentIfaces + " " + unknownDrop,
 		"\t\toifname " + agentIfaces + " drop",
 		"\t}",
 		"\tchain input {",
 		"\t\ttype filter hook input priority filter; policy accept;",
 		"\t\tiifname " + agentIfaces + " iifname vmap @" + inputMap,
-		"\t\tiifname " + agentIfaces + " " + logLimit + ` log prefix "` + logPrefix + `? "`,
+		"\t\tiifname " + agentIfaces + " " + unknownDrop,
 		"\t\tiifname " + agentIfaces + " drop",
+		"\t\tiifname != \"lo\" ip daddr " + agentNetwork + " " + unknownDrop,
+		"\t\tiifname != \"lo\" ip daddr " + agentNetwork + " drop",
 		"\t}",
 		"\tchain postrouting {",
 		"\t\ttype nat hook postrouting priority srcnat; policy accept;",
@@ -100,10 +117,13 @@ func renderBase() string {
 // come from parseTarget; renderAgent panics otherwise.
 func renderAgent(agentID string, slot int, targets []Target) string {
 	n := namesFor(agentID, slot)
-	tcp, udp := normalise(targets, "tcp"), normalise(targets, "udp")
+	tcp, udp, err := setContents(targets)
+	if err != nil {
+		panic("netns: unchecked targets: " + err.Error())
+	}
 	from := "ip saddr " + n.AgentIP
 	drop := []string{
-		"\t\t" + logLimit + ` log prefix "` + logPrefix + agentID + ` "`,
+		"\t\tlimit name \"" + n.Limit + `" log prefix "` + logPrefix + agentID + ` "`,
 		"\t\tdrop",
 	}
 
@@ -145,14 +165,18 @@ func renderAgent(agentID string, slot int, targets []Target) string {
 // refuses an element that overlaps one it already holds.
 func renderTargets(agentID string, targets []Target) string {
 	n := setNames(agentID)
+	tcp, udp, err := setContents(targets)
+	if err != nil {
+		panic("netns: unchecked targets: " + err.Error())
+	}
 	lines := []string{
 		"flush set " + table + " " + n.TCPSet,
 		"flush set " + table + " " + n.UDPSet,
 	}
-	if tcp := normalise(targets, "tcp"); len(tcp) > 0 {
+	if len(tcp) > 0 {
 		lines = append(lines, "add element "+table+" "+n.TCPSet+" { "+strings.Join(tcp, ", ")+" }")
 	}
-	if udp := normalise(targets, "udp"); len(udp) > 0 {
+	if len(udp) > 0 {
 		lines = append(lines, "add element "+table+" "+n.UDPSet+" { "+strings.Join(udp, ", ")+" }")
 	}
 	return strings.Join(lines, "\n") + "\n"
@@ -176,6 +200,7 @@ func renderRemove(agentID string, slot int) string {
 		"delete chain "+table+" "+n.InChain,
 		"delete set "+table+" "+n.TCPSet,
 		"delete set "+table+" "+n.UDPSet,
+		"delete limit "+table+" "+n.Limit,
 	)
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -188,8 +213,8 @@ func setNames(agentID string) names {
 	return names{TCPSet: "t_" + agentID, UDPSet: "u_" + agentID}
 }
 
-// declarations declares the maps and an agent's empty sets and chains, so
-// that the flush and delete commands after it find them.
+// declarations declares the maps and an agent's empty sets and chains and
+// its limit, so that the flush and delete commands after it find them.
 func declarations(n names) []string {
 	lines := []string{
 		"table " + table + " {",
@@ -203,6 +228,9 @@ func declarations(n names) []string {
 	lines = append(lines, setBlock(n.TCPSet, nil)...)
 	lines = append(lines, setBlock(n.UDPSet, nil)...)
 	return append(lines,
+		"\tlimit "+n.Limit+" {",
+		"\t\trate "+logRate,
+		"\t}",
 		"\tchain "+n.Chain+" {",
 		"\t}",
 		"\tchain "+n.InChain+" {",
@@ -225,6 +253,16 @@ func setBlock(name string, elements []string) []string {
 
 func mapEntry(mapName, veth, chain string) string {
 	return "add element " + table + " " + mapName + ` { "` + veth + `" : jump ` + chain + " }"
+}
+
+// setContents returns the elements of an agent's TCP and UDP sets, or an
+// error when together they would be more than maxElements.
+func setContents(targets []Target) (tcp, udp []string, err error) {
+	tcp, udp = normalise(targets, "tcp"), normalise(targets, "udp")
+	if count := len(tcp) + len(udp); count > maxElements {
+		return nil, nil, fmt.Errorf("targets make %d set elements, more than %d", count, maxElements)
+	}
+	return tcp, udp, nil
 }
 
 // portRange is an inclusive range of ports.
@@ -256,21 +294,16 @@ func normalise(targets []Target, proto string) []string {
 	}
 	slices.SortFunc(networks, comparePrefixes)
 
-	// granted returns the merged ports of the networks that hold network,
-	// itself included or not.
-	granted := func(network netip.Prefix, itself bool) []portRange {
-		var all []portRange
-		for _, other := range networks {
-			if within(network, other) && (itself || other != network) {
-				all = append(all, ports[other]...)
-			}
-		}
-		return mergePorts(all)
-	}
-
+	// Keep a network only if it adds ports to those of the wider networks.
 	var kept []netip.Prefix
 	for _, network := range networks {
-		if !coveredBy(mergePorts(ports[network]), granted(network, false)) {
+		var wider []portRange
+		for _, other := range networks {
+			if other != network && within(network, other) {
+				wider = append(wider, ports[other]...)
+			}
+		}
+		if !coveredBy(mergePorts(ports[network]), mergePorts(wider)) {
 			kept = append(kept, network)
 		}
 	}
@@ -281,13 +314,21 @@ func normalise(targets []Target, proto string) []string {
 	}
 	var elements []element
 	for _, network := range kept {
+		// The parts of network outside the narrower kept networks get the
+		// ports of every network that holds network, itself included.
 		var inner []netip.Prefix
 		for _, other := range kept {
 			if other != network && within(other, network) {
 				inner = append(inner, other)
 			}
 		}
-		portsHere := granted(network, true)
+		var holding []portRange
+		for _, other := range networks {
+			if within(network, other) {
+				holding = append(holding, ports[other]...)
+			}
+		}
+		portsHere := mergePorts(holding)
 		for _, block := range exclude(network, inner) {
 			for _, r := range portsHere {
 				elements = append(elements, element{block, r})

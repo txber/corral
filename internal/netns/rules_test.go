@@ -87,12 +87,12 @@ func setElements(t *testing.T, text, set string) []element {
 
 func TestAgentRulesNameOnlyThisAgent(t *testing.T) {
 	text := renderAgent("w1", 7, someTargets(t))
-	for _, name := range []string{"ocv7", "198.18.7.1", "198.18.7.2", "18007", "a_w1", "i_w1", "t_w1", "u_w1", `"corral-drop w1 "`} {
+	for _, name := range []string{"ocv7", "198.18.7.1", "198.18.7.2", "18007", "a_w1", "i_w1", "t_w1", "u_w1", "l_w1", `"corral-drop w1 "`} {
 		if !strings.Contains(text, name) {
 			t.Errorf("rules lack %s", name)
 		}
 	}
-	for _, pattern := range []string{`ocv(?:[0-689]|7\d)`, `198\.18\.(?:[0-689]|7\d)`, `\b[aitu]_(?:[^w]|w[^1]|w1\w)`, `corral-drop (?:[^w]|w[^1]|w1\w)`} {
+	for _, pattern := range []string{`ocv(?:[0-689]|7\d)`, `198\.18\.(?:[0-689]|7\d)`, `\b[ailtu]_(?:[^w]|w[^1]|w1\w)`, `corral-drop (?:[^w]|w[^1]|w1\w)`} {
 		if found := regexp.MustCompile(pattern).FindString(text); found != "" {
 			t.Errorf("rules name %q, which is not this agent's", found)
 		}
@@ -195,7 +195,7 @@ func TestAgentRulesLogAndDropTheRest(t *testing.T) {
 	for _, chain := range []string{"a_w1", "i_w1"} {
 		rules := chainBody(t, text, chain)
 		n := len(rules)
-		if n < 3 || rules[n-1] != "drop" || rules[n-2] != `limit rate 10/second log prefix "corral-drop w1 "` {
+		if n < 3 || rules[n-1] != "drop" || rules[n-2] != `limit name "l_w1" log prefix "corral-drop w1 "` {
 			t.Fatalf("chain %s does not end in log and drop: %q", chain, rules)
 		}
 		// Only IPv4 from the agent's own address is accepted, so IPv6 and
@@ -242,7 +242,11 @@ func TestTrafficTowardsAgentsIsOnlyEstablished(t *testing.T) {
 			towards = append(towards, rule)
 		}
 	}
-	want := []string{`oifname "ocv*" ct state established,related accept`, `oifname "ocv*" drop`}
+	want := []string{
+		`oifname "ocv*" ct state established,related accept`,
+		`oifname "ocv*" limit rate 10/second log prefix "corral-drop ? "`,
+		`oifname "ocv*" drop`,
+	}
 	if !slices.Equal(towards, want) {
 		t.Errorf("rules towards agents = %q, want %q", towards, want)
 	}
@@ -270,7 +274,7 @@ func TestInputOpensOnlyTheProxyPort(t *testing.T) {
 	text := renderAgent("w1", 7, someTargets(t))
 	want := []string{
 		"ip saddr 198.18.7.2 ip daddr 198.18.7.1 tcp dport 18007 accept",
-		`limit rate 10/second log prefix "corral-drop w1 "`,
+		`limit name "l_w1" log prefix "corral-drop w1 "`,
 		"drop",
 	}
 	if got := chainBody(t, text, "i_w1"); !slices.Equal(got, want) {
@@ -315,21 +319,39 @@ func TestUnmappedAgentInterfaceIsLoggedBeforeTheDrop(t *testing.T) {
 	}
 }
 
-func TestBaseChainsAcceptByDefaultAndTouchOnlyAgentInterfaces(t *testing.T) {
+// TestBaseChainsAcceptByDefaultAndTouchOnlyAgentTraffic: the base chains
+// act on traffic of the agents' interfaces, and on traffic addressed to the
+// agents' range that arrives on any interface but loopback.
+func TestBaseChainsAcceptByDefaultAndTouchOnlyAgentTraffic(t *testing.T) {
 	text := renderBase()
 	if hooks, accepts := strings.Count(text, " hook "), strings.Count(text, "policy accept;"); hooks == 0 || hooks != accepts {
 		t.Errorf("%d hooks, %d accept policies", hooks, accepts)
 	}
 	for _, chain := range []string{"forward", "input", "postrouting"} {
 		for _, rule := range chainBody(t, text, chain) {
-			if !strings.HasPrefix(rule, `iifname "ocv*" `) && !strings.HasPrefix(rule, `oifname "ocv*" `) {
-				t.Errorf("base %s rule %q does not start with an agent interface", chain, rule)
+			if !strings.HasPrefix(rule, `iifname "ocv*" `) && !strings.HasPrefix(rule, `oifname "ocv*" `) &&
+				!strings.HasPrefix(rule, `iifname != "lo" ip daddr 198.18.0.0/16 `) {
+				t.Errorf("base %s rule %q does not start with agent traffic", chain, rule)
 			}
 		}
 	}
 	want := []string{`iifname "ocv*" oifname != "ocv*" ip saddr 198.18.0.0/16 masquerade`}
 	if got := chainBody(t, text, "postrouting"); !slices.Equal(got, want) {
 		t.Errorf("postrouting = %q, want %q", got, want)
+	}
+}
+
+func TestInputDropsTheAgentRangeFromOtherInterfaces(t *testing.T) {
+	rules := chainBody(t, renderBase(), "input")
+	want := []string{
+		`iifname "ocv*" iifname vmap @input_agents`,
+		`iifname "ocv*" limit rate 10/second log prefix "corral-drop ? "`,
+		`iifname "ocv*" drop`,
+		`iifname != "lo" ip daddr 198.18.0.0/16 limit rate 10/second log prefix "corral-drop ? "`,
+		`iifname != "lo" ip daddr 198.18.0.0/16 drop`,
+	}
+	if !slices.Equal(rules, want) {
+		t.Errorf("base input = %q, want %q", rules, want)
 	}
 }
 
@@ -361,6 +383,7 @@ func TestRemoveDeletesTheAgentRulesChainsAndSets(t *testing.T) {
 		"delete chain inet corral i_w1",
 		"delete set inet corral t_w1",
 		"delete set inet corral u_w1",
+		"delete limit inet corral l_w1",
 	} {
 		if !strings.Contains(text, line+"\n") {
 			t.Errorf("remove lacks %q", line)
@@ -431,4 +454,113 @@ func randomTarget(t *testing.T, rng *rand.Rand) Target {
 	proto := []string{"tcp", "udp"}[rng.IntN(2)]
 	text := network.String() + ":" + proto + ":" + strconv.Itoa(first) + "-" + strconv.Itoa(last)
 	return mustTarget(t, text)
+}
+
+// TestCompleteRules shows the whole text the kernel receives for the base
+// table and for one agent.
+func TestCompleteRules(t *testing.T) {
+	const base = `table inet corral {
+	map forward_agents {
+		type ifname : verdict;
+	}
+	map input_agents {
+		type ifname : verdict;
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+}
+flush chain inet corral forward
+flush chain inet corral input
+flush chain inet corral postrouting
+table inet corral {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		iifname "ocv*" iifname vmap @forward_agents
+		iifname "ocv*" limit rate 10/second log prefix "corral-drop ? "
+		iifname "ocv*" drop
+		oifname "ocv*" ct state established,related accept
+		oifname "ocv*" limit rate 10/second log prefix "corral-drop ? "
+		oifname "ocv*" drop
+	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "ocv*" iifname vmap @input_agents
+		iifname "ocv*" limit rate 10/second log prefix "corral-drop ? "
+		iifname "ocv*" drop
+		iifname != "lo" ip daddr 198.18.0.0/16 limit rate 10/second log prefix "corral-drop ? "
+		iifname != "lo" ip daddr 198.18.0.0/16 drop
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		iifname "ocv*" oifname != "ocv*" ip saddr 198.18.0.0/16 masquerade
+	}
+}
+`
+	const agent = `table inet corral {
+	map forward_agents {
+		type ifname : verdict;
+	}
+	map input_agents {
+		type ifname : verdict;
+	}
+	set t_w1 {
+		type ipv4_addr . inet_service;
+		flags interval;
+	}
+	set u_w1 {
+		type ipv4_addr . inet_service;
+		flags interval;
+	}
+	limit l_w1 {
+		rate 10/second
+	}
+	chain a_w1 {
+	}
+	chain i_w1 {
+	}
+}
+flush chain inet corral a_w1
+flush chain inet corral i_w1
+flush set inet corral t_w1
+flush set inet corral u_w1
+table inet corral {
+	set t_w1 {
+		type ipv4_addr . inet_service;
+		flags interval;
+		elements = { 10.10.4.0/24 . 1-1024 }
+	}
+	set u_w1 {
+		type ipv4_addr . inet_service;
+		flags interval;
+		elements = { 10.10.4.7 . 53 }
+	}
+	chain a_w1 {
+		ip saddr 198.18.7.2 ct state established,related accept
+		ip saddr 198.18.7.2 oifname != "ocv*" ip daddr . tcp dport @t_w1 accept
+		ip saddr 198.18.7.2 oifname != "ocv*" ip daddr . udp dport @u_w1 accept
+		limit name "l_w1" log prefix "corral-drop w1 "
+		drop
+	}
+	chain i_w1 {
+		ip saddr 198.18.7.2 ip daddr 198.18.7.1 tcp dport 18007 accept
+		limit name "l_w1" log prefix "corral-drop w1 "
+		drop
+	}
+}
+add element inet corral forward_agents { "ocv7" : jump a_w1 }
+add element inet corral input_agents { "ocv7" : jump i_w1 }
+`
+	if got := renderBase(); got != base {
+		t.Errorf("renderBase() =\n%s\nwant\n%s", got, base)
+	}
+	if got := renderAgent("w1", 7, someTargets(t)); got != agent {
+		t.Errorf("renderAgent() =\n%s\nwant\n%s", got, agent)
+	}
 }

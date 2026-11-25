@@ -88,6 +88,7 @@ func TestNamesForSlot7(t *testing.T) {
 		InChain:   "i_w1",
 		TCPSet:    "t_w1",
 		UDPSet:    "u_w1",
+		Limit:     "l_w1",
 		ProxyPort: 18007,
 	}
 	if got := namesFor("w1", 7); got != want {
@@ -205,6 +206,28 @@ func TestTooManyTargetsAreRefused(t *testing.T) {
 	}
 	if _, err := parseArgs(args[:len(args)-2]); err != nil {
 		t.Errorf("%d targets refused: %v", maxTargets, err)
+	}
+}
+
+// TestTargetsWithTooManySetElementsAreRefused: 256 targets can split into
+// hundreds of thousands of set elements; such a list is refused before
+// anything is rendered.
+func TestTargetsWithTooManySetElementsAreRefused(t *testing.T) {
+	args := []string{"up", "w1", "7"}
+	// 128 separate ports on a /8 ...
+	for i := range 128 {
+		args = append(args, "--target", "10.0.0.0/8:tcp:"+strconv.Itoa(1+2*i))
+	}
+	// ... and 128 hosts inside it that each add a port, so that each host
+	// cuts the /8 into about 24 blocks that all carry the 128 ports.
+	for i := range 128 {
+		args = append(args, "--target", "10."+strconv.Itoa(i)+".0.1:tcp:"+strconv.Itoa(30001+2*i))
+	}
+	var stdout, stderr bytes.Buffer
+	code := Main(args, &stdout, &stderr)
+	firstLine, _, _ := strings.Cut(stderr.String(), "\n")
+	if code != 2 || !strings.Contains(firstLine, "targets") || !strings.Contains(firstLine, "4096") {
+		t.Errorf("Main = %d, %q; want 2 and an error naming the targets and the bound", code, firstLine)
 	}
 }
 

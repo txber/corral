@@ -1,10 +1,23 @@
-# corral
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/corral-lockup-on-dark.svg">
+    <img src=".github/corral-lockup-on-light.svg" alt="corral: a fence for autonomous agents" width="460">
+  </picture>
+</h1>
 
-corral is being built to run AI agents inside a fence: a supervisor that is
-not an agent will start each agent in a sandbox, limit what it may reach, and
-ask a human about everything beyond that.
+corral is being built to run AI agents inside a fence. A supervisor that is
+not an agent will start each agent in a sandbox, and three things will hold
+for every one of them:
 
-corral is at an early stage. So far only `corral version` runs.
+- **Scope** is the fence: the hosts, ports and folders the agent may reach.
+- **Approval** is the gate: what lies beyond the scope is asked for, and a
+  human decides.
+- **Events** are the record: what an agent does, and every decision made
+  about it, is written down.
+
+## Status
+
+Early. So far only `corral version` runs; the parts are added one by one.
 
 ## Build and test
 

@@ -7,10 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // subscriberBuffer is how many records a subscriber may fall behind before it
@@ -19,6 +23,10 @@ const subscriberBuffer = 256
 
 // reserved are the names of the fixed fields of every record.
 var reserved = []string{"seq", "ts", "job", "agent_id", "role", "type"}
+
+// maxDepth is how many levels of maps and slices a field value may nest. It
+// keeps every line far below the depth that encoding/json reads back.
+const maxDepth = 32
 
 // Log is an open event log. It is safe for concurrent use.
 type Log struct {
@@ -34,8 +42,12 @@ type Log struct {
 
 // Open opens the event log at path for the given job. It creates the file
 // with mode 600, or tightens an existing file to 600, and continues the
-// sequence after the last complete line.
+// sequence after the last complete line. The job name is checked like the
+// names in a record (see Write).
 func Open(path, job string) (*Log, error) {
+	if err := checkName(job); err != nil {
+		return nil, fmt.Errorf("event log job %q: %w", job, err)
+	}
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open event log: %w", err)
@@ -71,11 +83,12 @@ func lastSeq(data []byte) int {
 	}
 	lines := bytes.Split(data[:end], []byte{'\n'})
 	for i := len(lines) - 1; i >= 0; i-- {
-		var rec struct {
-			Seq int `json:"seq"`
-		}
-		if json.Unmarshal(lines[i], &rec) == nil && rec.Seq > 0 {
-			return rec.Seq
+		// Decoding into a struct would match "SEQ" or "Seq" too; a map keeps
+		// the key "seq" apart from caller fields named like it.
+		var rec map[string]json.RawMessage
+		var seq int
+		if json.Unmarshal(lines[i], &rec) == nil && json.Unmarshal(rec["seq"], &seq) == nil && seq > 0 {
+			return seq
 		}
 	}
 	return 0
@@ -83,12 +96,25 @@ func lastSeq(data []byte) int {
 
 // Write appends one record and returns it. An empty agentID or role is
 // written as null. The record's fixed fields come first, in a fixed order,
-// followed by the caller's fields sorted by name. Fields may not use the name
-// of a fixed field.
+// followed by the caller's fields sorted by name.
+//
+// Write refuses a record rather than change it, so that the line in the file
+// always reads back as the record returned; the caller decides what to write
+// instead. It refuses a field named like a fixed field in any case; a name
+// (type, agent id, role, field name or key of a nested map) that is not valid
+// UTF-8 or holds a control character; a string value that is not valid UTF-8;
+// a number that is NaN or infinite; and a value nested deeper than 32 levels
+// of maps and slices. A refused record writes nothing and uses no seq.
 func (l *Log) Write(typ, agentID, role string, fields map[string]any) (map[string]any, error) {
-	for _, name := range reserved {
-		if _, clash := fields[name]; clash {
-			return nil, fmt.Errorf("event field %q is reserved", name)
+	for _, fixed := range []struct{ what, value string }{{"type", typ}, {"agent id", agentID}, {"role", role}} {
+		if err := checkName(fixed.value); err != nil {
+			return nil, fmt.Errorf("event %s %q: %w", fixed.what, fixed.value, err)
+		}
+	}
+	extra := slices.Sorted(maps.Keys(fields))
+	for _, name := range extra {
+		if err := checkField(name, fields[name]); err != nil {
+			return nil, fmt.Errorf("event field %q: %w", name, err)
 		}
 	}
 
@@ -106,16 +132,10 @@ func (l *Log) Write(typ, agentID, role string, fields map[string]any) (map[strin
 		"role":     nullIfEmpty(role),
 		"type":     typ,
 	}
-	names := slices.Clone(reserved)
 	for name, value := range fields {
 		record[name] = value
 	}
-	extra := make([]string, 0, len(fields))
-	for name := range fields {
-		extra = append(extra, name)
-	}
-	slices.Sort(extra)
-	names = append(names, extra...)
+	names := append(slices.Clone(reserved), extra...)
 
 	line, err := encode(record, names)
 	if err != nil {
@@ -142,6 +162,66 @@ func (l *Log) Write(typ, agentID, role string, fields map[string]any) (map[strin
 	return record, nil
 }
 
+// checkName returns why name cannot be written as it is, or nil.
+func checkName(name string) error {
+	if !utf8.ValidString(name) {
+		return errors.New("not valid UTF-8")
+	}
+	if strings.ContainsFunc(name, unicode.IsControl) {
+		return errors.New("holds a control character")
+	}
+	return nil
+}
+
+// checkField returns why a caller's field cannot be written as it is, or nil.
+func checkField(name string, value any) error {
+	for _, fixed := range reserved {
+		// encoding/json matches names without regard to case when it reads
+		// a line back, so "SEQ" could stand for "seq".
+		if strings.EqualFold(name, fixed) {
+			return errors.New("name is reserved")
+		}
+	}
+	if err := checkName(name); err != nil {
+		return err
+	}
+	return checkValue(value, 0)
+}
+
+// checkValue returns why value, depth levels down in a field, cannot be
+// written as it is, or nil. It looks into the maps and slices that decoded
+// JSON is made of; numbers that JSON cannot hold are left to the encoder.
+func checkValue(value any, depth int) error {
+	switch v := value.(type) {
+	case string:
+		if !utf8.ValidString(v) {
+			return errors.New("a string value is not valid UTF-8")
+		}
+	case []any:
+		if depth == maxDepth {
+			return fmt.Errorf("nested deeper than %d levels", maxDepth)
+		}
+		for _, elem := range v {
+			if err := checkValue(elem, depth+1); err != nil {
+				return err
+			}
+		}
+	case map[string]any:
+		if depth == maxDepth {
+			return fmt.Errorf("nested deeper than %d levels", maxDepth)
+		}
+		for key, elem := range v {
+			if err := checkName(key); err != nil {
+				return fmt.Errorf("key %q of a nested map: %w", key, err)
+			}
+			if err := checkValue(elem, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // nullIfEmpty turns an empty string into nil so that it is written as null.
 func nullIfEmpty(s string) any {
 	if s == "" {
@@ -165,13 +245,18 @@ func encode(record map[string]any, names []string) ([]byte, error) {
 		}
 		value, err := encodeValue(record[name])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("field %q: %w", name, err)
 		}
 		buf.Write(key)
 		buf.WriteByte(':')
 		buf.Write(value)
 	}
 	buf.WriteString("}\n")
+	// A value that checkValue does not look into, such as a json.RawMessage,
+	// can still nest too deeply for encoding/json to read the line back.
+	if !json.Valid(buf.Bytes()) {
+		return nil, errors.New("record does not read back as JSON")
+	}
 	return buf.Bytes(), nil
 }
 

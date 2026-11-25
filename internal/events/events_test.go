@@ -303,3 +303,163 @@ func TestWriteAfterCloseFailsAndCloseTwiceIsFine(t *testing.T) {
 		t.Errorf("second close = %v, want nil", err)
 	}
 }
+
+func TestFieldNamedLikeAFixedFieldInAnotherCaseIsRefused(t *testing.T) {
+	l, path := openLog(t)
+	// "ſeq" starts with the long s, which folds to s.
+	for _, name := range []string{"SEQ", "Seq", "ſeq", "Agent_ID", "TYPE"} {
+		if _, err := l.Write("x", "", "", map[string]any{name: 1}); err == nil {
+			t.Errorf("field %q was accepted", name)
+		}
+	}
+	if data, _ := os.ReadFile(path); len(data) != 0 {
+		t.Errorf("refused writes left data in the file: %q", data)
+	}
+}
+
+func TestReopeningReadsOnlyTheExactSeqKey(t *testing.T) {
+	// A file written before such names were refused can still hold them.
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	old := `{"seq":1,"ts":"2026-11-25T08:10:29.898Z","job":"j","agent_id":null,"role":null,"type":"x","Seq":1000000}` + "\n" +
+		`{"seq":2,"ts":"2026-11-25T08:10:29.899Z","job":"j","agent_id":null,"role":null,"type":"x","SEQ":-5}` + "\n"
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := Open(path, "j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	rec, err := l.Write("x", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec["seq"] != 3 {
+		t.Errorf("seq = %v, want 3", rec["seq"])
+	}
+}
+
+// nested wraps v in n levels, alternating slices and maps that hold it
+// under key.
+func nested(v any, key string, n int) any {
+	for i := 0; i < n; i++ {
+		if i%2 == 0 {
+			v = []any{v}
+		} else {
+			v = map[string]any{key: v}
+		}
+	}
+	return v
+}
+
+func TestValueNestedDeeperThan32LevelsIsRefused(t *testing.T) {
+	l, path := openLog(t)
+	_, err := l.Write("x", "", "", map[string]any{"deep": nested("s", "k", 33)})
+	if err == nil {
+		t.Fatal("33 levels were accepted")
+	}
+	if !strings.Contains(err.Error(), `"deep"`) {
+		t.Errorf("error does not name the field: %v", err)
+	}
+	if data, _ := os.ReadFile(path); len(data) != 0 {
+		t.Errorf("refused write left data in the file: %q", data)
+	}
+	if _, err := l.Write("x", "", "", map[string]any{"deep": nested("s", "k", 32)}); err != nil {
+		t.Errorf("32 levels were refused: %v", err)
+	}
+}
+
+func TestValueTenThousandLevelsDeepIsRefused(t *testing.T) {
+	// The JSON encoder alone accepts this depth, but the line around it
+	// would be one level too deep to read back.
+	l, path := openLog(t)
+	if _, err := l.Write("x", "", "", map[string]any{"deep": nested("s", "k", 10000)}); err == nil {
+		t.Error("nested value was accepted")
+	}
+	raw := json.RawMessage(strings.Repeat("[", 10000) + strings.Repeat("]", 10000))
+	if _, err := l.Write("x", "", "", map[string]any{"raw": raw}); err == nil {
+		t.Error("raw JSON value was accepted")
+	}
+	if data, _ := os.ReadFile(path); len(data) != 0 {
+		t.Errorf("refused writes left data in the file: %q", data)
+	}
+}
+
+func TestNamesWithInvalidTextAreRefused(t *testing.T) {
+	for _, bad := range []string{"a\xff", "a\nb", "a\x00", "a\u0085"} {
+		writes := map[string]func(l *Log) error{
+			"type":       func(l *Log) error { _, err := l.Write(bad, "", "", nil); return err },
+			"agent id":   func(l *Log) error { _, err := l.Write("x", bad, "", nil); return err },
+			"role":       func(l *Log) error { _, err := l.Write("x", "", bad, nil); return err },
+			"field name": func(l *Log) error { _, err := l.Write("x", "", "", map[string]any{bad: 1}); return err },
+			"nested key": func(l *Log) error {
+				_, err := l.Write("x", "", "", map[string]any{"f": []any{map[string]any{bad: 1}}})
+				return err
+			},
+		}
+		for where, write := range writes {
+			l, path := openLog(t)
+			if err := write(l); err == nil {
+				t.Errorf("%s %q was accepted", where, bad)
+			}
+			if data, _ := os.ReadFile(path); len(data) != 0 {
+				t.Errorf("refused %s %q left data in the file: %q", where, bad, data)
+			}
+		}
+	}
+}
+
+func TestFieldNamesThatDifferOnlyInInvalidBytesAreRefused(t *testing.T) {
+	// Written as they are, both names would turn into the same key.
+	l, path := openLog(t)
+	_, err := l.Write("x", "", "", map[string]any{"a\xff": "s", "a\xfe": "t"})
+	if err == nil {
+		t.Fatal("write was accepted")
+	}
+	if data, _ := os.ReadFile(path); len(data) != 0 {
+		t.Errorf("refused write left data in the file: %q", data)
+	}
+}
+
+func TestStringValuesWithInvalidUTF8AreRefused(t *testing.T) {
+	l, path := openLog(t)
+	for _, value := range []any{"a\xff", []any{"ok", "a\xfe"}, map[string]any{"k": "a\xc0"}} {
+		_, err := l.Write("x", "", "", map[string]any{"text": value})
+		if err == nil {
+			t.Errorf("value %q was accepted", value)
+		} else if !strings.Contains(err.Error(), `"text"`) {
+			t.Errorf("error does not name the field: %v", err)
+		}
+	}
+	if data, _ := os.ReadFile(path); len(data) != 0 {
+		t.Errorf("refused writes left data in the file: %q", data)
+	}
+}
+
+func TestStringValuesKeepLineBreaksAndControlCharacters(t *testing.T) {
+	l, path := openLog(t)
+	text := "one\ntwo\r\x00 "
+	if _, err := l.Write("x", "", "", map[string]any{"text": text}); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(readLines(t, path)[0]), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["text"] != text {
+		t.Errorf("text = %q, want %q", got["text"], text)
+	}
+}
+
+func TestOpenRefusesAJobNameWithInvalidText(t *testing.T) {
+	for _, job := range []string{"j\xff", "j\n", "j\x7f"} {
+		path := filepath.Join(t.TempDir(), "events.jsonl")
+		if l, err := Open(path, job); err == nil {
+			l.Close()
+			t.Errorf("job %q was accepted", job)
+		}
+		if _, err := os.Stat(path); err == nil {
+			t.Errorf("job %q: the file was created", job)
+		}
+	}
+}

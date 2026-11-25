@@ -31,7 +31,7 @@ func Decide(r integration.Request, s scope.Scope, resolve func(string) (string, 
 	case "network":
 		return decideNetwork(r, s)
 	default:
-		return deny("request kind %q is not decided automatically", r.Kind)
+		return deny("request kind %.200q is not decided automatically", r.Kind)
 	}
 }
 
@@ -40,38 +40,46 @@ func decidePath(path string, s scope.Scope, resolve func(string) (string, error)
 	// A relative path is denied before it is resolved, so that it can never be
 	// read against the supervisor's own working folder.
 	if !filepath.IsAbs(path) {
-		return deny("path %q is not absolute", path)
+		return deny("path %.200q is not absolute", path)
 	}
 	if strings.ContainsRune(path, 0) {
-		return deny("path %q contains a NUL byte", path)
+		return deny("path %.200q contains a NUL byte", path)
 	}
 	resolved, err := resolve(path)
 	if err != nil {
-		return deny("cannot resolve path %q: %v", path, err)
+		// A file system error repeats the path; name only its cause, so that the
+		// path does not appear twice at full length.
+		var pathErr *fs.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return deny("cannot resolve path %.200q: %.150q", path, err)
 	}
 	if !s.AllowsPath(resolved) {
-		return deny("%q is outside the scope", resolved)
+		return deny("%.200q is outside the scope", resolved)
 	}
-	return integration.Decision{Decision: "granted", Reason: fmt.Sprintf("%q is inside the scope", resolved)}
+	return integration.Decision{Decision: "granted", Reason: fmt.Sprintf("%.200q is inside the scope", resolved)}
 }
 
 // decideNetwork checks every address as tcp, whatever protocol the agent
 // meant: the scope's udp targets are not for agents to ask about.
 func decideNetwork(r integration.Request, s scope.Scope) integration.Decision {
 	if len(r.Addresses) == 0 {
-		return deny("no resolved addresses for host %q", r.Host)
+		return deny("no resolved addresses for host %.200q", r.Host)
 	}
 	for _, addr := range r.Addresses {
 		if !s.AllowsTarget(addr, "tcp", r.Port) {
-			return deny("%q on tcp port %d is outside the scope", addr, r.Port)
+			return deny("%.200q on tcp port %d is outside the scope", addr, r.Port)
 		}
 	}
 	return integration.Decision{
 		Decision: "grant_session",
-		Reason:   fmt.Sprintf("all %d addresses of host %q are inside the scope on tcp port %d", len(r.Addresses), r.Host, r.Port),
+		Reason:   fmt.Sprintf("all %d addresses of host %.200q are inside the scope on tcp port %d", len(r.Addresses), r.Host, r.Port),
 	}
 }
 
+// deny builds a denial. Every request-supplied text in a reason is cut to
+// 200 characters (%.200q), because reasons go into the event log.
 func deny(format string, args ...any) integration.Decision {
 	return integration.Decision{Decision: "denied", Reason: fmt.Sprintf(format, args...)}
 }

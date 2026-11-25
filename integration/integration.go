@@ -3,6 +3,16 @@
 // interfaces below (Sandbox, KeyProxy or Runtime) and registers a factory for
 // it under a name in an init function; corral links the package in and
 // builds the tool by the name its configuration gives.
+//
+// Network modes, and who does what:
+//
+//	"direct"  The network is confined from outside (namespace and firewall), so the
+//	          sandbox must not restrict it. A KeyProxy serves the gateway at
+//	          GatewayURL; the runtime passes GatewayToken on in TokenEnv.
+//	"none"    The sandbox itself confines the agent to the model gateway and injects
+//	          the key: it serves the gateway inside the sandbox at
+//	          http://127.0.0.1:<ProxyPort>/<Gateway.Name>, which is GatewayURL, and sets
+//	          TokenEnv for the agent program. No KeyProxy is used and GatewayToken is empty.
 package integration
 
 import (
@@ -16,21 +26,28 @@ import (
 )
 
 // Request is one permission request, in corral's terms.
+// The sandbox integration fills every field from what the sandbox itself
+// observed, never from what the agent claims.
 type Request struct {
-	Kind      string // "path", "network" or "other"
-	ID        string
-	Path      string
-	Access    string
-	Host      string
-	Port      int
-	Addresses []string
-	Detail    string // for "other": what was asked, for the log
+	Kind      string   // "path", "network" or "other"
+	ID        string   // the sandbox's own id for the request, to pair the answer with it
+	Path      string   // for "path": the absolute path the sandbox will open
+	Access    string   // for "path": the access asked for, such as "read"; logged, not decided on
+	Host      string   // for "network": the host name asked for; not decided on, yet a "grant_session" covers it
+	Port      int      // for "network": the TCP port the sandbox will connect to
+	Addresses []string // for "network": the addresses the sandbox itself resolved Host to and will connect to, never ones the agent supplies
+	Detail    string   // for "other": what was asked, for the log
 }
 
 // Decision is the answer to one Request.
 type Decision struct {
-	Decision string // "granted", "denied", "grant_session" or "deny_session"
-	Reason   string
+	// Decision is one of:
+	//   "granted"        this one request may proceed;
+	//   "denied"         this one request is refused;
+	//   "grant_session"  the sandbox may allow Host:Port for the rest of the session without asking again;
+	//   "deny_session"   the sandbox may refuse the same request for the rest of the session without asking again.
+	Decision string
+	Reason   string // what the decision was made on, for the log
 }
 
 // Endpoint is one HTTP method and path that the model gateway serves.
@@ -89,15 +106,6 @@ type Record struct {
 	OK     bool
 	Usage  *Usage // tokens and cost, when the record carries them
 }
-
-// Network modes, and who does what:
-//   "direct"  The network is confined from outside (namespace and firewall), so the
-//             sandbox must not restrict it. A KeyProxy serves the gateway at
-//             GatewayURL; the runtime passes GatewayToken on in TokenEnv.
-//   "none"    The sandbox itself confines the agent to the model gateway and injects
-//             the key: it serves the gateway inside the sandbox at
-//             http://127.0.0.1:<ProxyPort>/<Gateway.Name>, which is GatewayURL, and sets
-//             TokenEnv for the agent program. No KeyProxy is used and GatewayToken is empty.
 
 // Sandbox confines one agent process.
 type Sandbox interface {

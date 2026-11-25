@@ -22,7 +22,9 @@ type fakeRuntime struct {
 	options map[string]any
 }
 
-func TestRegistryBuildsWhatTheFactoryReturns(t *testing.T) {
+// The registry is global and refuses a name twice, so the tests register
+// their names once per process, here, and not in each run of a test.
+func init() {
 	RegisterSandbox("test-build", func(options map[string]any) (Sandbox, error) {
 		return &fakeSandbox{options: options}, nil
 	})
@@ -32,6 +34,12 @@ func TestRegistryBuildsWhatTheFactoryReturns(t *testing.T) {
 	RegisterRuntime("test-build", func(options map[string]any) (Runtime, error) {
 		return &fakeRuntime{options: options}, nil
 	})
+	RegisterRuntime("test-list-b", func(map[string]any) (Runtime, error) { return &fakeRuntime{}, nil })
+	RegisterRuntime("test-list-a", func(map[string]any) (Runtime, error) { return &fakeRuntime{}, nil })
+	RegisterSandbox("test-twice", func(map[string]any) (Sandbox, error) { return &fakeSandbox{}, nil })
+}
+
+func TestRegistryBuildsWhatTheFactoryReturns(t *testing.T) {
 	options := map[string]any{"marker": "x"}
 
 	sandbox, err := NewSandbox("test-build", options)
@@ -60,9 +68,6 @@ func TestRegistryBuildsWhatTheFactoryReturns(t *testing.T) {
 }
 
 func TestUnknownNameListsTheRegisteredOnes(t *testing.T) {
-	RegisterRuntime("test-list-b", func(map[string]any) (Runtime, error) { return &fakeRuntime{}, nil })
-	RegisterRuntime("test-list-a", func(map[string]any) (Runtime, error) { return &fakeRuntime{}, nil })
-
 	runtime, err := NewRuntime("missing", nil)
 	if err == nil {
 		t.Fatalf("NewRuntime(missing) = %#v, want an error", runtime)
@@ -88,12 +93,11 @@ func TestUnknownNameListsTheRegisteredOnes(t *testing.T) {
 }
 
 func TestRegisteringTwicePanics(t *testing.T) {
-	factory := func(map[string]any) (Sandbox, error) { return &fakeSandbox{}, nil }
-	RegisterSandbox("test-twice", factory)
+	// init has registered "test-twice" once already.
 	defer func() {
 		if recover() == nil {
 			t.Error("registering a name twice did not panic")
 		}
 	}()
-	RegisterSandbox("test-twice", factory)
+	RegisterSandbox("test-twice", func(map[string]any) (Sandbox, error) { return &fakeSandbox{}, nil })
 }

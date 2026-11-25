@@ -277,6 +277,31 @@ func TestOtherAndUnknownKindsAreDenied(t *testing.T) {
 	}
 }
 
+func TestLongRequestTextsAreCutInTheReason(t *testing.T) {
+	long := strings.Repeat("a", 10000)
+	tests := []struct {
+		name    string
+		request integration.Request
+		resolve func(string) (string, error)
+	}{
+		{"path outside", pathRequest("/" + long), identity},
+		{"path that cannot be resolved", pathRequest("/" + long), nil},
+		{"relative path", pathRequest(long), identity},
+		{"host without addresses", integration.Request{Kind: "network", Host: long, Port: 445}, nil},
+		{"address", networkRequest(445, long), nil},
+		{"kind", integration.Request{Kind: long}, nil},
+	}
+	for _, tt := range tests {
+		d := Decide(tt.request, testScope(t), tt.resolve)
+		if d.Decision != "denied" {
+			t.Errorf("%s: decision = %q, want denied", tt.name, d.Decision)
+		}
+		if len(d.Reason) >= 400 {
+			t.Errorf("%s: reason is %d bytes long, want under 400", tt.name, len(d.Reason))
+		}
+	}
+}
+
 // realTempDir returns a fresh temporary folder with every symbolic link in
 // its path resolved, so that it can serve as a scope path.
 func realTempDir(t *testing.T) string {

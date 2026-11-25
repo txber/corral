@@ -33,7 +33,7 @@ bookkeeping. It is made for one person on one machine.
 | Command | State |
 |---|---|
 | `corral version` | works |
-| `corral netns`, the network fence for one agent | checks its arguments; the commands are being built |
+| `corral netns`, the network fence for one agent | works, on its own too; needs root through sudo |
 | `corral run` and the client commands | not yet |
 
 ## Setup
@@ -56,7 +56,81 @@ Run the tests with `go test ./...`.
 corral version
 ```
 
-This section grows as the commands above arrive.
+The supervisor is not finished, but the network fence can be used on its own.
+
+### `corral netns`: a network fence for one agent
+
+`corral netns` gives an agent a network namespace of its own, with firewall
+rules that let it reach only its targets and one proxy port on this machine.
+It runs as root through sudo.
+
+```sh
+sudo corral netns up    <agent_id> <slot> [--target <target>]...
+sudo corral netns allow <agent_id> <slot> --target <target> [--target <target>]...
+sudo corral netns exec  <agent_id> --env-file <path> -- <command> [<arg>...]
+sudo corral netns down  <agent_id> <slot>
+sudo corral netns list
+```
+
+- `up` creates the namespace, a veth pair joining it to this machine, and the
+  agent's rules. It refuses an agent id or a slot that is in use. It records
+  the agent first, so `down` can also clear what an interrupted `up` left.
+- `allow` adds targets to a running agent; open connections stay open.
+- `exec` runs a command, given by its absolute path, inside the namespace as
+  the user who called sudo: without capabilities, with `no_new_privs` set so
+  that nothing it starts can gain privileges again, and with exactly the
+  variables of the env file as its environment. The env file must belong to
+  that user, have mode 600, and hold at most 64 lines of `KEY=VALUE` in at
+  most 64 KiB. No root process ever holds its variables: the file is read
+  only after the drop to the user, by `corral netns enter`, which `exec`
+  starts itself and which is not meant to be called directly.
+- `down` stops what runs in the namespace and removes the namespace, the veth
+  pair and the rules. It succeeds when there is nothing left to remove, and
+  fails, after removing the rest, if a process would not stop.
+- `list` prints one `<agent_id> <slot>` line per agent.
+
+An agent id is a lowercase letter followed by up to 11 lowercase letters or
+digits. A slot is a number from 1 to 250. A target is
+`<ip[/prefix]>:<tcp|udp>:<port[-port]>`, for example `192.0.2.7:udp:53` or
+`10.10.4.0/24:tcp:1-1024`. Agent `<id>` in slot `<n>` gets:
+
+| What | Name or address |
+|---|---|
+| namespace | `oc-<id>` |
+| veth, this machine's end | `ocv<n>`, `198.18.<n>.1/30` |
+| veth, the agent's end | `eth0`, `198.18.<n>.2/30` |
+| proxy port | `198.18.<n>.1`, TCP `18000+<n>` |
+| rules | chains, sets and a log limit named `*_<id>` in table `inet corral` |
+| record | `/run/corral/<id>` |
+
+Dropped traffic goes to the kernel log with the prefix `corral-drop <id> `,
+at most 10 lines a second per agent. The table `inet corral` stays in place
+once created, also after the last `down`: its base rules keep any leftover
+`ocv*` interface closed.
+
+What it needs:
+
+- `ip`, `nft`, `nsenter` and `setpriv` in `/usr/sbin`, `/usr/bin`, `/sbin` or
+  `/bin`;
+- IPv4 forwarding (`net.ipv4.ip_forward = 1`), which it does not switch on
+  itself;
+- a sudoers file, if a supervisor is to call it without a password. With the
+  binary installed root-owned as `/opt/corral/bin/corral`:
+
+  ```
+  Cmnd_Alias CORRAL_NETNS = /opt/corral/bin/corral netns *
+  Defaults!CORRAL_NETNS !pam_session
+  you ALL=(root) NOPASSWD: CORRAL_NETNS
+  ```
+
+  `!pam_session` keeps the launched command in the calling user's cgroup.
+  Whoever holds this grant controls every agent's namespace: the helper
+  records no owners and is made for one operator.
+
+What it does not do: it starts no sandbox and no proxy, resolves no host
+names, passes no IPv6 (off on this machine's end of each pair, and dropped by
+the rules), changes no system setting, keeps nothing across a reboot, and
+refuses to run inside any network namespace but the machine's own.
 
 ## Configuration
 

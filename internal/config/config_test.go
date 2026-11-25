@@ -1,11 +1,18 @@
 package config
 
 import (
+	"math"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
 
 // validConfig is a complete corral.toml; each refusal test changes one line of it.
@@ -218,6 +225,341 @@ func TestTildeIsExpanded(t *testing.T) {
 	}
 	if cfg.Paths.Work != "/home/you/work" {
 		t.Errorf("work = %q", cfg.Paths.Work)
+	}
+}
+
+// A dotted key names its tables only through the key itself, as PATHS does in
+// PATHS.helper; every part of such a key must still be spelt as the schema
+// says. The error names the whole key.
+func TestDottedKeysAreCheckedPartByPart(t *testing.T) {
+	t.Setenv("HOME", "/home/you")
+	configs := []struct{ name, text, key string }{
+		{"unknown top-level table", "nope.x = 1\n" + validConfig, "nope.x"},
+		{"paths in the wrong case", "PATHS.helper = \"/opt/other\"\n" + validConfig, "PATHS.helper"},
+		{"gateway in the wrong case", "GATEWAY.upstream = \"https://other.example/v1\"\n" + validConfig, "GATEWAY.upstream"},
+		{"sandbox in the wrong case", "Sandbox.use = \"other\"\n" + validConfig, "Sandbox.use"},
+		{"unknown table in gateway", strings.Replace(validConfig, "[gateway]\n", "[gateway]\nX.y = 1\n", 1), "gateway.X.y"},
+		{"field used as a table", strings.Replace(validConfig, "[gateway]\n", "[gateway]\nNAME.x = 1\n", 1), "gateway.NAME.x"},
+		{"unknown table header", validConfig + "[paths.extra]\nx = 1\n", "paths.extra"},
+	}
+	for _, c := range configs {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Load(writeFile(t, c.text))
+			if err == nil || !strings.Contains(err.Error(), "unknown key "+c.key) {
+				t.Errorf("error = %v, want one naming %s", err, c.key)
+			}
+		})
+	}
+
+	roles := []struct{ name, text, key string }{
+		{"unknown role field", validRole + "colour.x = 1\n", "worker.colour.x"},
+		{"cost in the wrong case", validRole + "COST.extra = 1\n", "worker.COST.extra"},
+		{"cost key in the wrong case", strings.Replace(validRole, "cost = { input = 1.0, output = 2.0, cacheRead = 0.5, cacheWrite = 0.0 }",
+			"cost.input = 1.0\ncost.output = 2.0\ncost.cacheRead = 0.5\ncost.CacheWrite = 0.0", 1), "worker.cost.CacheWrite"},
+	}
+	for _, c := range roles {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := LoadRoles(writeFile(t, c.text))
+			if err == nil || !strings.Contains(err.Error(), "unknown key "+c.key) {
+				t.Errorf("error = %v, want one naming %s", err, c.key)
+			}
+		})
+	}
+}
+
+func TestOptionTablesStayFreeForm(t *testing.T) {
+	text := strings.Replace(validConfig, `use = "runner"`, "use = \"runner\"\nFlags.Deep = 1", 1)
+	cfg, err := Load(writeFile(t, text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runtime.Options["Flags"] == nil {
+		t.Errorf("runtime options = %+v", cfg.Runtime.Options)
+	}
+	roles, err := LoadRoles(writeFile(t, validRole+"options.Some.Thing = 1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roles["worker"].Options["Some"] == nil {
+		t.Errorf("role options = %+v", roles["worker"].Options)
+	}
+}
+
+func TestTextMustBeValidUTF8WithoutControlCharacters(t *testing.T) {
+	t.Setenv("HOME", "/home/you")
+	configs := []struct{ name, old, new, key string }{
+		{"key file", `key_file = "/home/you/.keys/example"`, `key_file = "/home/you/.keys/ex\u0000ample"`, "gateway.key_file"},
+		{"path", `work = "/home/you/work"`, `work = "/home/you/work\n"`, "paths.work"},
+		{"helper", `roles = "/home/you/roles.toml"`, "roles = \"/home/you/roles.toml\"\nhelper = \"/opt/bin/corral\\u0085\"", "paths.helper"},
+		{"use", `use = "runner"`, `use = "run\u001bner"`, "runtime.use"},
+		{"option name", `use = "runner"`, "use = \"runner\"\n\"fla\\u0007g\" = 1", "runtime.fla"},
+	}
+	for _, c := range configs {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Load(writeFile(t, strings.Replace(validConfig, c.old, c.new, 1)))
+			if err == nil || !strings.Contains(err.Error(), c.key) || !strings.Contains(err.Error(), "control characters") {
+				t.Errorf("error = %v, want one naming %s", err, c.key)
+			}
+		})
+	}
+
+	roles := []struct{ name, old, new, key string }{
+		{"model", `model = "example-model"`, `model = "example-model\t"`, "worker.model"},
+		{"memory", `model = "example-model"`, "model = \"example-model\"\nmemory = \"2G\\u007f\"", "worker.memory"},
+		{"option name", `model = "example-model"`, "model = \"example-model\"\noptions = { \"a\\u0000\" = 1 }", "worker.options.a"},
+	}
+	for _, c := range roles {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := LoadRoles(writeFile(t, strings.Replace(validRole, c.old, c.new, 1)))
+			if err == nil || !strings.Contains(err.Error(), c.key) || !strings.Contains(err.Error(), "control characters") {
+				t.Errorf("error = %v, want one naming %s", err, c.key)
+			}
+		})
+	}
+
+	// The TOML reader refuses bytes that are not UTF-8, so this is checked
+	// on the function itself.
+	if err := checkText("file.toml", "paths.work", "/home/you/\xffwork"); err == nil {
+		t.Error("text that is not UTF-8 was accepted")
+	}
+}
+
+func TestEndpointPathHasNoSpaceOrControlCharacter(t *testing.T) {
+	for _, path := range []string{"/mod\tels", "/models\n", "/mod els", "/mod　els", "/mod els", "/mod\u007fels"} {
+		text := strings.Replace(validConfig, `"GET /models"`, strconv.Quote("GET "+path), 1)
+		_, err := Load(writeFile(t, text))
+		if err == nil || !strings.Contains(err.Error(), "gateway.endpoints") {
+			t.Errorf("path %q: error = %v, want one naming gateway.endpoints", path, err)
+		}
+	}
+}
+
+func TestUpstreamBeginsWithLowerCaseHTTPS(t *testing.T) {
+	for _, upstream := range []string{
+		"HTTPS://gateway.example/v1",
+		"Https://gateway.example/v1",
+		"https://gateway.example/v 1",
+		"https://gateway.example/v\t1",
+		"https://gateway.example/v1　",
+	} {
+		text := strings.Replace(validConfig, `"https://gateway.example/v1"`, strconv.Quote(upstream), 1)
+		_, err := Load(writeFile(t, text))
+		if err == nil || !strings.Contains(err.Error(), "gateway.upstream") {
+			t.Errorf("upstream %q: error = %v, want one naming gateway.upstream", upstream, err)
+		}
+	}
+}
+
+func TestErrorsQuoteAtMostEightyCharacters(t *testing.T) {
+	long := strings.Repeat("é", 400)
+	cut := `"` + strings.Repeat("é", 80) + `"…`
+
+	_, err := Load(writeFile(t, strings.Replace(validConfig, `name = "example"`, `name = "`+long+`"`, 1)))
+	if err == nil || !strings.Contains(err.Error(), cut) || strings.Contains(err.Error(), strings.Repeat("é", 81)) {
+		t.Errorf("gateway.name: error = %v", err)
+	}
+	_, err = LoadRoles(writeFile(t, strings.Replace(validRole, `"direct"`, `"`+long+`"`, 1)))
+	if err == nil || !strings.Contains(err.Error(), cut) || strings.Contains(err.Error(), strings.Repeat("é", 81)) {
+		t.Errorf("worker.network: error = %v", err)
+	}
+
+	// A value of 80 characters is quoted whole.
+	exact := strings.Repeat("x", 80)
+	_, err = Load(writeFile(t, strings.Replace(validConfig, `work = "/home/you/work"`, `work = "`+exact+`"`, 1)))
+	if err == nil || !strings.Contains(err.Error(), `"`+exact+`" must`) {
+		t.Errorf("paths.work: error = %v", err)
+	}
+}
+
+// wrongCaseConfig is validConfig written with dotted keys in the wrong case.
+const wrongCaseConfig = `max_agents = 4
+GATEWAY.name = "example"
+GATEWAY.upstream = "https://gateway.example/v1"
+GATEWAY.endpoints = ["GET /models"]
+GATEWAY.KEY_FILE = "/k"
+Paths.STATE = "/s"
+Paths.RUN = "/r"
+Paths.WORK = "/w"
+Paths.ROLES = "/r.toml"
+Paths.HELPER = "/h"
+Sandbox.use = "a"
+Runtime.use = "a"
+Key_Proxy.use = "a"
+`
+
+// FuzzLoad checks that whatever Load accepts is what the documentation
+// promises, and that its own errors are single lines of plain text.
+func FuzzLoad(f *testing.F) {
+	f.Setenv("HOME", "/home/you")
+	example, err := os.ReadFile("../../examples/corral.toml")
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(string(example))
+	f.Add(validConfig)
+	f.Add(wrongCaseConfig)
+	f.Add("nope.x = 1\n" + validConfig)
+	f.Add("GATEWAY.upstream = \"https://other.example/v1\"\nPATHS.helper = \"/opt/other\"\n" + validConfig)
+	f.Add(strings.Replace(validConfig, "[gateway]\n", "[gateway]\nX.y = 1\n", 1))
+	f.Add(strings.Replace(validConfig, `"GET /models"`, `"GET /mod\tels"`, 1))
+	f.Add(strings.Replace(validConfig, `https://`, `HTTPS://`, 1))
+	f.Add(strings.Replace(validConfig, `/v1"`, `/v 1"`, 1))
+	f.Add(strings.Replace(validConfig, `work = "/home/you/work"`, `work = "~/../x"`, 1))
+	f.Add(strings.Replace(validConfig, `name = "example"`, `name = "`+strings.Repeat("A", 400)+`"`, 1))
+	f.Add(strings.Replace(validConfig, `use = "runner"`, "use = \"runner\"\nx = [{ \"a\\u0000\" = 1 }]", 1))
+
+	f.Fuzz(func(t *testing.T, text string) {
+		cfg, err := Load(writeFile(t, text))
+		if err != nil {
+			checkError(t, err)
+			return
+		}
+		var doc map[string]any
+		if _, err := toml.Decode(text, &doc); err != nil {
+			t.Fatalf("accepted what the TOML reader refuses: %v", err)
+		}
+		checkKeys(t, doc, nil, configKeys)
+
+		if cfg.MaxAgents < 1 || cfg.MaxAgents > 250 {
+			t.Errorf("max_agents = %d", cfg.MaxAgents)
+		}
+		g := cfg.Gateway
+		if !gatewayName.MatchString(g.Name) {
+			t.Errorf("gateway.name = %q", g.Name)
+		}
+		u, err := url.Parse(g.Upstream)
+		if !strings.HasPrefix(g.Upstream, "https://") || !plainWord(g.Upstream) ||
+			err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			t.Errorf("gateway.upstream = %q", g.Upstream)
+		}
+		if len(g.Endpoints) == 0 {
+			t.Error("no endpoints")
+		}
+		for _, e := range g.Endpoints {
+			if !httpMethod.MatchString(e.Method) || !strings.HasPrefix(e.Path, "/") || !plainWord(e.Path) {
+				t.Errorf("endpoint %q %q", e.Method, e.Path)
+			}
+		}
+		for _, p := range []struct{ table, name, got string }{
+			{"gateway", "key_file", g.KeyFile},
+			{"paths", "state", cfg.Paths.State},
+			{"paths", "run", cfg.Paths.Run},
+			{"paths", "work", cfg.Paths.Work},
+			{"paths", "roles", cfg.Paths.Roles},
+			{"paths", "helper", cfg.Paths.Helper},
+		} {
+			table, _ := doc[p.table].(map[string]any)
+			raw, _ := table[p.name].(string)
+			if p.got == "" && raw == "" && p.name == "helper" {
+				continue
+			}
+			want := raw
+			if raw == "~" || strings.HasPrefix(raw, "~/") {
+				want = "/home/you" + raw[1:]
+			}
+			if p.got != path.Clean(want) || !path.IsAbs(p.got) || slices.Contains(strings.Split(raw, "/"), "..") || checkText("", "", p.got) != nil {
+				t.Errorf("%s.%s %q became %q", p.table, p.name, raw, p.got)
+			}
+		}
+		for table, use := range map[string]Use{"sandbox": cfg.Sandbox, "runtime": cfg.Runtime, "key_proxy": cfg.KeyProxy} {
+			m, _ := doc[table].(map[string]any)
+			if use.Name == "" || use.Name != m["use"] || checkText("", "", use.Name) != nil {
+				t.Errorf("%s.use = %q, the file says %q", table, use.Name, m["use"])
+			}
+			if _, ok := use.Options["use"]; ok {
+				t.Errorf("%s: the options hold use", table)
+			}
+		}
+	})
+}
+
+// FuzzLoadRoles checks that whatever LoadRoles accepts is what the
+// documentation promises, and that its own errors are single lines of plain
+// text.
+func FuzzLoadRoles(f *testing.F) {
+	example, err := os.ReadFile("../../examples/roles.toml")
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(string(example))
+	f.Add(validRole)
+	f.Add("")
+	f.Add(validRole + "colour.x = 1\n")
+	f.Add(validRole + "COST.extra = 1\n")
+	f.Add("worker.COST.Input = 99.0\n" + validRole)
+	f.Add(strings.Replace(validRole, "[worker]", `["`+strings.Repeat("w", 400)+`"]`, 1))
+	f.Add(strings.Replace(validRole, `"direct"`, `"`+strings.Repeat("d", 400)+`"`, 1))
+	f.Add(strings.Replace(validRole, "input = 1.0", "input = -0.0", 1))
+
+	f.Fuzz(func(t *testing.T, text string) {
+		roles, err := LoadRoles(writeFile(t, text))
+		if err != nil {
+			checkError(t, err)
+			return
+		}
+		var doc map[string]any
+		if _, err := toml.Decode(text, &doc); err != nil {
+			t.Fatalf("accepted what the TOML reader refuses: %v", err)
+		}
+		checkKeys(t, doc, nil, roleKeys)
+
+		if len(roles) == 0 || len(roles) != len(doc) {
+			t.Errorf("%d roles from %d tables", len(roles), len(doc))
+		}
+		for name, r := range roles {
+			if _, ok := doc[name]; !ok || r.Name != name || !roleName.MatchString(name) {
+				t.Errorf("role %q named %q", name, r.Name)
+			}
+			if r.Network != "direct" && r.Network != "proxy" && r.Network != "none" {
+				t.Errorf("%s.network = %q", name, r.Network)
+			}
+			if r.Model == "" || checkText("", "", r.Model) != nil || checkText("", "", r.Limits.Memory) != nil {
+				t.Errorf("%s: model %q, memory %q", name, r.Model, r.Limits.Memory)
+			}
+			if r.Limits.MaxProcesses < 0 {
+				t.Errorf("%s.max_processes = %d", name, r.Limits.MaxProcesses)
+			}
+			for _, c := range []float64{r.Cost.Input, r.Cost.Output, r.Cost.CacheRead, r.Cost.CacheWrite} {
+				if math.IsNaN(c) || math.IsInf(c, 0) || c < 0 {
+					t.Errorf("%s: cost %v", name, c)
+				}
+			}
+		}
+	})
+}
+
+// checkError fails when one of corral's own errors is not one line of plain
+// text. The TOML reader's messages, which follow "read <file>:", may quote
+// the file as it is.
+func checkError(t *testing.T, err error) {
+	t.Helper()
+	if !strings.HasPrefix(err.Error(), "read ") && checkText("", "", err.Error()) != nil {
+		t.Errorf("error is not one line of plain text: %q", err)
+	}
+}
+
+// checkKeys fails for every key in v, a value read from a TOML file at key,
+// that is not plain text or not allowed by the schema that allowed describes.
+func checkKeys(t *testing.T, v any, key toml.Key, allowed func(parent toml.Key) []string) {
+	t.Helper()
+	switch v := v.(type) {
+	case map[string]any:
+		names := allowed(key)
+		for name, child := range v {
+			full := append(slices.Clone(key), name)
+			if checkText("", "", name) != nil || names != nil && !slices.Contains(names, name) {
+				t.Errorf("accepted the key %s", full)
+			}
+			checkKeys(t, child, full, allowed)
+		}
+	case []map[string]any:
+		for _, m := range v {
+			checkKeys(t, m, key, allowed)
+		}
+	case []any:
+		for _, e := range v {
+			checkKeys(t, e, key, allowed)
+		}
 	}
 }
 

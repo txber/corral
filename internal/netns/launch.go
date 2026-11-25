@@ -53,13 +53,13 @@ func execInside(agentID, envFile string, argv []string) error {
 }
 
 // execCommandLine returns the nsenter command line that enters the agent's
-// namespace and has setpriv drop to uid and gid, with the user's groups and
-// no inheritable capabilities, before self runs "netns enter".
+// namespace and has setpriv drop to uid and gid, with the user's groups, no
+// inheritable capabilities and no_new_privs, before self runs "netns enter".
 func execCommandLine(nsenter, setpriv, self, agentID string, uid, gid int, envFile string, argv []string) []string {
 	line := []string{
 		nsenter, "--net=" + filepath.Join(netnsDir, netnsPrefix+agentID), "--",
 		setpriv, "--reuid=" + strconv.Itoa(uid), "--regid=" + strconv.Itoa(gid),
-		"--init-groups", "--inh-caps=-all", "--",
+		"--init-groups", "--inh-caps=-all", "--no-new-privs", "--",
 		self, "netns", "enter", "--env-file", envFile, "--",
 	}
 	return append(line, argv...)
@@ -79,9 +79,10 @@ func callerID(name, text string) (int, error) {
 
 // enter is the second, unprivileged half of exec: it reads the env file as
 // the user it runs as and replaces itself with the command, whose whole
-// environment is the file's variables. It refuses to run as root or with
-// any capability, so that it never reads an env file with privileges.
-// Called directly, it only runs a command as oneself.
+// environment is the file's variables. It refuses to run as root, with any
+// capability or without no_new_privs, however it was reached: so it never
+// reads an env file with privileges, and nothing it starts can gain them,
+// through sudo or any other set-user-ID program.
 func enter(envFile string, argv []string) error {
 	if os.Getuid() == 0 || os.Geteuid() == 0 {
 		return errors.New("refusing to run as root")
@@ -93,46 +94,37 @@ func enter(envFile string, argv []string) error {
 	if hasEffectiveCapabilities(string(status)) {
 		return errors.New("refusing to run with capabilities")
 	}
+	if !hasNoNewPrivs(string(status)) {
+		return errors.New("refusing to run without no_new_privs; enter is started by exec")
+	}
 	env, err := readEnvFile(envFile, os.Getuid())
 	if err != nil {
 		return err
 	}
-	path, err := commandPath(argv[0], env)
-	if err != nil {
-		return err
-	}
-	return fmt.Errorf("starting %s: %w", argv[0], syscall.Exec(path, argv, env))
+	return fmt.Errorf("starting %s: %w", argv[0], syscall.Exec(argv[0], argv, env))
 }
 
 // hasEffectiveCapabilities reports whether the CapEff line of a
 // /proc/<pid>/status text shows any capability. Without the line it
 // answers yes.
 func hasEffectiveCapabilities(status string) bool {
-	for _, line := range strings.Split(status, "\n") {
-		if mask, ok := strings.CutPrefix(line, "CapEff:"); ok {
-			return strings.Trim(strings.TrimSpace(mask), "0") != ""
-		}
-	}
-	return true
+	mask, ok := statusValue(status, "CapEff")
+	return !ok || strings.Trim(mask, "0") != ""
 }
 
-// commandPath finds a command the way a shell would, in the PATH of env, or
-// /usr/bin:/bin when env sets none. A name with a slash is taken as it is.
-func commandPath(name string, env []string) (string, error) {
-	if strings.Contains(name, "/") {
-		return name, nil
-	}
-	searchPath := "/usr/bin:/bin"
-	for _, variable := range env {
-		if value, ok := strings.CutPrefix(variable, "PATH="); ok {
-			searchPath = value
+// hasNoNewPrivs reports whether a /proc/<pid>/status text shows
+// no_new_privs set. Without the line it answers no.
+func hasNoNewPrivs(status string) bool {
+	value, ok := statusValue(status, "NoNewPrivs")
+	return ok && value == "1"
+}
+
+// statusValue returns the value of one line of a /proc/<pid>/status text.
+func statusValue(status, name string) (string, bool) {
+	for _, line := range strings.Split(status, "\n") {
+		if value, ok := strings.CutPrefix(line, name+":"); ok {
+			return strings.TrimSpace(value), true
 		}
 	}
-	for _, dir := range filepath.SplitList(searchPath) {
-		path := filepath.Join(dir, name)
-		if info, err := os.Stat(path); dir != "" && err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
-			return path, nil
-		}
-	}
-	return "", fmt.Errorf("%s not found in PATH", name)
+	return "", false
 }

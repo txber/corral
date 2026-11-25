@@ -53,11 +53,12 @@ const usage = `usage:
   corral netns down  <agent_id> <slot>
   corral netns list
   corral netns enter --env-file <path> -- <command> [<arg>...]
-      (the second half of exec, run by it; not meant to be called directly)
+      (the second half of exec, run by it; refused when called directly)
 
 <agent_id> is a lowercase letter and up to 11 lowercase letters or digits,
 <slot> a number from 1 to 250, and <target> <ip[/prefix]>:<tcp|udp>:<port[-port]>,
-for example 10.10.4.0/24:tcp:1-1024 or 192.0.2.7:udp:53.
+for example 10.10.4.0/24:tcp:1-1024 or 192.0.2.7:udp:53. <path> and
+<command> are absolute paths without "..".
 `
 
 // Main runs one "corral netns" command line (without "netns") and returns the
@@ -360,9 +361,10 @@ func parseLaunch(name string, args []string) (command, error) {
 	if !strings.HasPrefix(envFile, "/") || strings.Contains(envFile, "\x00") || hasDotDot(envFile) {
 		return command{}, fmt.Errorf("bad --env-file %.80q: want an absolute path without ..", envFile)
 	}
+	// An absolute path, so that what runs does not depend on a search.
 	argv := args[3:]
-	if argv[0] == "" || strings.HasPrefix(argv[0], "-") {
-		return command{}, fmt.Errorf("bad command %.80q", argv[0])
+	if !strings.HasPrefix(argv[0], "/") || hasDotDot(argv[0]) {
+		return command{}, fmt.Errorf("bad command %.80q: want an absolute path without ..", argv[0])
 	}
 	for _, arg := range argv {
 		if strings.Contains(arg, "\x00") {

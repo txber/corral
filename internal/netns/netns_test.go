@@ -143,19 +143,19 @@ func TestCommandsAreParsed(t *testing.T) {
 		t.Errorf("allow = %+v, %v", allow, err)
 	}
 
-	run, err := parseArgs([]string{"exec", "w1", "--env-file", "/run/e", "--", "agent", "-x", "--"})
+	run, err := parseArgs([]string{"exec", "w1", "--env-file", "/run/e", "--", "/opt/agent", "-x", "--"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.agentID != "w1" || run.envFile != "/run/e" || !slices.Equal(run.argv, []string{"agent", "-x", "--"}) {
+	if run.agentID != "w1" || run.envFile != "/run/e" || !slices.Equal(run.argv, []string{"/opt/agent", "-x", "--"}) {
 		t.Errorf("exec = %+v", run)
 	}
 
-	enter, err := parseArgs([]string{"enter", "--env-file", "/run/e", "--", "agent", "-x"})
+	enter, err := parseArgs([]string{"enter", "--env-file", "/run/e", "--", "/opt/agent", "-x"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if enter.envFile != "/run/e" || !slices.Equal(enter.argv, []string{"agent", "-x"}) {
+	if enter.envFile != "/run/e" || !slices.Equal(enter.argv, []string{"/opt/agent", "-x"}) {
 		t.Errorf("enter = %+v", enter)
 	}
 
@@ -183,22 +183,27 @@ func TestBadCommandLinesAreRefused(t *testing.T) {
 		{"up", "w1", "7", "--target", "10.10.4.7:udp:53;x"},
 		{"up", "w1", "7", "extra"},
 		{"allow", "w1", "7"},
-		{"exec", "w1", "--", "agent"},
-		{"exec", "w1", "--env-file", "relative", "--", "agent"},
-		{"exec", "w1", "--env-file", "/run/../etc/shadow", "--", "agent"},
-		{"exec", "w1", "--env-file", "/run/e\x00", "--", "agent"},
+		{"exec", "w1", "--", "/opt/agent"},
+		{"exec", "w1", "--env-file", "relative", "--", "/opt/agent"},
+		{"exec", "w1", "--env-file", "/run/../etc/shadow", "--", "/opt/agent"},
+		{"exec", "w1", "--env-file", "/run/e\x00", "--", "/opt/agent"},
 		{"exec", "w1", "--env-file", "/run/e", "agent"},
 		{"exec", "w1", "--env-file", "/run/e", "--"},
 		{"exec", "w1", "--env-file", "/run/e", "--", "-agent"},
+		{"exec", "w1", "--env-file", "/run/e", "--", "agent"},
+		{"exec", "w1", "--env-file", "/run/e", "--", "./agent"},
+		{"exec", "w1", "--env-file", "/run/e", "--", "/opt/../agent"},
 		{"exec", "w1", "--env-file", "/run/e", "--", ""},
-		{"exec", "w1", "--env-file", "/run/e", "--", "agent", "a\x00b"},
-		{"exec", "W1", "--env-file", "/run/e", "--", "agent"},
-		{"enter", "w1", "--env-file", "/run/e", "--", "agent"},
-		{"enter", "--env-file", "relative", "--", "agent"},
-		{"enter", "--env-file", "/run/../e", "--", "agent"},
+		{"exec", "w1", "--env-file", "/run/e", "--", "/opt/agent", "a\x00b"},
+		{"exec", "W1", "--env-file", "/run/e", "--", "/opt/agent"},
+		{"enter", "w1", "--env-file", "/run/e", "--", "/opt/agent"},
+		{"enter", "--env-file", "relative", "--", "/opt/agent"},
+		{"enter", "--env-file", "/run/../e", "--", "/opt/agent"},
 		{"enter", "--env-file", "/run/e", "agent"},
 		{"enter", "--env-file", "/run/e", "--"},
 		{"enter", "--env-file", "/run/e", "--", "-agent"},
+		{"enter", "--env-file", "/run/e", "--", "agent"},
+		{"enter", "--env-file", "/run/e", "--", "/opt/../agent"},
 		{"down", "w1", "7", "8"},
 		{"down", "w1", "7", "--target", "10.10.4.7:udp:53"},
 		{"list", "x"},
@@ -257,7 +262,7 @@ func TestBadArgumentsExitTwoAndNameTheArgument(t *testing.T) {
 		{[]string{"up", "w1", "7", "--target", "10.10.4.7:tcp:0"}, "target"},
 		{[]string{"up", "w1", "7", "--tagret", "10.10.4.7:tcp:80"}, "--tagret"},
 		{[]string{"allow", "w1", "7"}, "--target"},
-		{[]string{"exec", "w1", "--env-file", "env", "--", "agent"}, "env-file"},
+		{[]string{"exec", "w1", "--env-file", "env", "--", "/opt/agent"}, "env-file"},
 		{[]string{"exec", "w1", "--env-file", "/run/e", "--", "-agent"}, "command"},
 		{[]string{"list", "x"}, "list"},
 	}
@@ -281,11 +286,14 @@ func TestBadArgumentsExitTwoAndNameTheArgument(t *testing.T) {
 }
 
 func TestExecWithoutSudoIsRefused(t *testing.T) {
+	// Run as an ordinary user, exec stops at the namespace check or, where
+	// /proc/1 is readable, at the missing SUDO_UID; either way it runs
+	// nothing.
 	t.Setenv("SUDO_UID", "")
 	var stdout, stderr bytes.Buffer
-	code := Main([]string{"exec", "w1", "--env-file", "/run/e", "--", "agent"}, &stdout, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), "SUDO_UID") {
-		t.Errorf("Main(exec) = %d, %q; want 1 and a word about SUDO_UID", code, stderr.String())
+	code := Main([]string{"exec", "w1", "--env-file", "/run/e", "--", "/opt/agent"}, &stdout, &stderr)
+	if code != 1 || stdout.Len() != 0 {
+		t.Errorf("Main(exec) = %d, stdout %q, stderr %q; want 1", code, stdout.String(), stderr.String())
 	}
 }
 

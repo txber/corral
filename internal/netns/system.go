@@ -27,14 +27,25 @@ const (
 	netnsDir    = "/run/netns" // where ip keeps named namespaces
 	toolTimeout = 30 * time.Second
 	stopTimeout = 2 * time.Second // how long down waits after SIGTERM
+
+	// maxKillPasses bounds how often down lists and kills what is left in a
+	// namespace.
+	maxKillPasses = 5
 )
 
 // toolDirs are the folders the tools are looked up in, in this order. PATH
 // is never used: the caller of sudo may have a say in it.
 var toolDirs = []string{"/usr/sbin", "/usr/bin", "/sbin", "/bin"}
 
-// execute runs a checked command.
+// execute runs a checked command. All but enter run as root and act on
+// the machine's own network, so they refuse to run in any other network
+// namespace, such as an agent's.
 func execute(c command, stdout io.Writer) error {
+	if c.name != "enter" {
+		if err := checkInitialNamespace(); err != nil {
+			return err
+		}
+	}
 	switch c.name {
 	case "up":
 		return up(c.agentID, c.slot, c.targets)
@@ -50,6 +61,23 @@ func execute(c command, stdout io.Writer) error {
 		return list(stdout)
 	}
 	return fmt.Errorf("unknown command %q", c.name)
+}
+
+// checkInitialNamespace returns an error unless the helper runs in the
+// network namespace of process 1.
+func checkInitialNamespace() error {
+	self, err := os.Stat("/proc/self/ns/net")
+	if err != nil {
+		return err
+	}
+	first, err := os.Stat("/proc/1/ns/net")
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(self, first) {
+		return errors.New("refusing to run outside the machine's own network namespace")
+	}
+	return nil
 }
 
 // up creates an agent's namespace, veth pair and rules. It refuses an agent
@@ -82,6 +110,14 @@ func up(agentID string, slot int, targets []Target) (err error) {
 		}
 	}
 
+	// The record comes first, so that whatever a killed up leaves behind
+	// carries its slot and down can remove it. Its removal is the last
+	// step of the undo.
+	if err := writeState(agentID, agentState{slot: slot, targets: targets}); err != nil {
+		return err
+	}
+	defer onFailure(&err, func() error { return removeState(agentID) })
+
 	n := namesFor(agentID, slot)
 	if err := nft(renderBase()); err != nil {
 		return err
@@ -91,11 +127,11 @@ func up(agentID string, slot int, targets []Target) (err error) {
 	if err := ip("netns", "add", n.Netns); err != nil {
 		return err
 	}
-	defer onFailure(&err, func() error { return ip("netns", "delete", n.Netns) })
+	defer onFailure(&err, func() error { return deleteNetns(n.Netns) })
 	if err := ip("link", "add", n.Veth, "type", "veth", "peer", "name", "eth0", "netns", n.Netns); err != nil {
 		return err
 	}
-	defer onFailure(&err, func() error { return ip("link", "delete", n.Veth) })
+	defer onFailure(&err, func() error { return deleteLink(n.Veth) })
 
 	// With IPv6 on, the agent's router solicitations reach the rules on a
 	// host that forwards IPv6, which drop and log them. Off on the root end,
@@ -125,7 +161,7 @@ func up(agentID string, slot int, targets []Target) (err error) {
 			return err
 		}
 	}
-	return writeState(agentID, agentState{slot: slot, targets: targets})
+	return nil
 }
 
 // onFailure runs undo if *err is set when the calling function returns,
@@ -199,54 +235,91 @@ func down(agentID string, slot int) error {
 		}
 	}
 
+	// Processes that will not stop do not stop the teardown; down then
+	// reports them at the end.
 	n := namesFor(agentID, slot)
-	netnsPath := filepath.Join(netnsDir, n.Netns)
-	if exists(netnsPath) {
-		if err := stopProcesses(n.Netns); err != nil {
-			return err
-		}
+	var stopErr error
+	if exists(filepath.Join(netnsDir, n.Netns)) {
+		stopErr = stopProcesses(n.Netns)
 	}
 	// Deleting the root end removes both ends at once; the kernel removes
 	// a namespace's links only some time after the namespace is deleted.
-	if exists(filepath.Join("/sys/class/net", n.Veth)) {
-		if err := ip("link", "delete", n.Veth); err != nil {
-			return err
-		}
+	if err := deleteLink(n.Veth); err != nil {
+		return errors.Join(stopErr, err)
 	}
-	if exists(netnsPath) {
-		if err := ip("netns", "delete", n.Netns); err != nil {
-			return err
-		}
+	if err := deleteNetns(n.Netns); err != nil {
+		return errors.Join(stopErr, err)
 	}
 	if err := nft(renderRemove(agentID, slot)); err != nil {
-		return err
+		return errors.Join(stopErr, err)
 	}
-	return removeState(agentID)
+	return errors.Join(stopErr, removeState(agentID))
+}
+
+// deleteLink deletes a link of the root namespace if it exists.
+func deleteLink(name string) error {
+	if !exists(filepath.Join("/sys/class/net", name)) {
+		return nil
+	}
+	return ip("link", "delete", name)
+}
+
+// deleteNetns deletes a named namespace if it exists.
+func deleteNetns(name string) error {
+	if !exists(filepath.Join(netnsDir, name)) {
+		return nil
+	}
+	return ip("netns", "delete", name)
 }
 
 // stopProcesses ends what runs in a namespace: SIGTERM, up to two seconds
-// to exit, then SIGKILL for what is left.
+// to exit, then SIGKILL, repeated for what is still listed, at most
+// maxKillPasses times, so that a process that keeps forking is caught.
 func stopProcesses(netns string) error {
+	ns, err := os.Stat(filepath.Join(netnsDir, netns))
+	if err != nil {
+		return err
+	}
 	pids, err := namespacePIDs(netns)
 	if err != nil {
 		return err
 	}
-	signal(pids, syscall.SIGTERM)
+	signalInNamespace(pids, ns, syscall.SIGTERM)
 	for deadline := time.Now().Add(stopTimeout); len(pids) > 0 && time.Now().Before(deadline); {
 		time.Sleep(100 * time.Millisecond)
 		if pids, err = namespacePIDs(netns); err != nil {
 			return err
 		}
 	}
-	signal(pids, syscall.SIGKILL)
+	for pass := 0; pass < maxKillPasses && len(pids) > 0; pass++ {
+		signalInNamespace(pids, ns, syscall.SIGKILL)
+		time.Sleep(100 * time.Millisecond)
+		if pids, err = namespacePIDs(netns); err != nil {
+			return err
+		}
+	}
+	if len(pids) > 0 {
+		return fmt.Errorf("%d processes still run in %s", len(pids), netns)
+	}
 	return nil
 }
 
-// signal sends sig to each process. A process that is already gone is
-// fine.
-func signal(pids []int, sig syscall.Signal) {
+// signalInNamespace sends sig to each listed process that is in the
+// namespace ns. A pid is only a number the kernel may have given to another
+// process since it was listed, so each process is first taken by a handle
+// (on Linux, os.FindProcess holds a pidfd, which names the process itself),
+// then checked to be in the namespace, and signalled through the handle.
+func signalInNamespace(pids []int, ns os.FileInfo, sig syscall.Signal) {
 	for _, pid := range pids {
-		_ = syscall.Kill(pid, sig)
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		member, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", pid))
+		if err == nil && os.SameFile(member, ns) {
+			_ = process.Signal(sig) // a process that is gone by now is fine
+		}
+		process.Release()
 	}
 }
 

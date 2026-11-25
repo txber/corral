@@ -5,124 +5,72 @@
   </picture>
 </h1>
 
-corral is being built to run AI agents inside a fence. A supervisor that is
-not an agent will start each agent in a sandbox, and three things will hold
-for every one of them:
+corral runs AI agents inside a fence. You say what each agent may reach,
+corral holds it to that, asks you before anything else happens, and keeps a
+record of everything.
 
-- **Scope** is the fence: the hosts, ports and folders the agent may reach.
-- **Approval** is the gate: what lies beyond the scope is asked for, and a
-  human decides.
-- **Events** are the record: what an agent does, and every decision made
-  about it, is written down.
+> **Status: under construction.** The supervisor that ties the parts together
+> is not finished yet. See [What works today](#what-works-today).
 
 ## What corral is for
 
-corral keeps agents inside a boundary and keeps a human at the gate. That is
-the whole job:
+Agents that run commands and read the web are useful, and they read things
+you did not write. corral is for running them without having to trust them.
 
-- start and stop agent programs, each inside a sandbox;
-- confine each agent to the hosts, ports and folders it was given, enforced
-  below the agent;
-- answer an agent's permission requests from what it was given, and pass
-  everything else to a human;
-- keep model keys out of an agent's reach;
-- apply limits, and write every start, stop, grant and denial to one log.
+- **A fence.** Each agent gets a list of hosts, ports and folders. It reaches
+  nothing else, and that is enforced from outside the agent, by a sandbox and
+  a firewall.
+- **A gate.** When an agent wants something that is not on its list, the
+  request comes to you. No answer means no.
+- **A record.** Every start, stop, grant and refusal goes into one log.
 
-What it is not:
+corral is neither an agent nor a sandbox. It is the supervisor between them:
+it starts the agent program inside the sandbox tool you chose and does the
+bookkeeping. It is made for one person on one machine.
 
-- not an agent: it holds no model and no prompt, and it does not plan work or
-  split it up;
-- not a sandbox or a firewall of its own: it drives existing tools through
-  small interfaces, so each can be replaced;
-- not tied to a kind of work, a model provider, an agent program or a user
-  interface;
-- not a platform: one operator, one machine.
+## What works today
 
-A change belongs in corral if it makes the fence, the gate or the record
-better for any agent and any kind of work. What helps only one setup belongs
-in that setup's configuration or in an integration.
-
-## Status
-
-Early. So far `corral version` and `corral netns` run; the parts are added
-one by one.
-
-## Build and test
-
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o corral ./cmd/corral
-    go test ./...
-
-## Network namespaces: `corral netns`
-
-`corral netns` gives each agent a network namespace of its own and firewall
-rules that let it reach only its targets and one proxy port on this machine.
-It runs as root through sudo and can be used on its own:
-
-    corral netns up    <agent_id> <slot> [--target <target>]...
-    corral netns allow <agent_id> <slot> --target <target> [--target <target>]...
-    corral netns exec  <agent_id> --env-file <path> -- <command> [<arg>...]
-    corral netns down  <agent_id> <slot>
-    corral netns list
-
-- `up` creates the namespace, a veth pair joining it to this machine and the
-  agent's rules. It refuses an agent id or a slot that is in use, and removes
-  what it created when a step fails.
-- `allow` adds targets to a running agent; open connections stay open.
-- `exec` runs a command inside the namespace as the user who called sudo,
-  without capabilities, and with exactly the variables of the env file as its
-  environment. The env file must belong to that user, have mode 600, hold at
-  most 64 lines of `KEY=VALUE` and be no larger than 64 KiB; variables that
-  would change how the launching tools run as root, such as `LD_PRELOAD`,
-  are refused.
-- `down` stops what runs in the namespace and removes the namespace, the veth
-  pair and the rules. It succeeds when there is nothing left to remove.
-- `list` prints one `<agent_id> <slot>` line per agent.
-
-An agent id is a lowercase letter and up to 11 lowercase letters or digits, a
-slot a number from 1 to 250, and a target `<ip[/prefix]>:<tcp|udp>:<port[-port]>`,
-for example `192.0.2.7:udp:53` or `10.10.4.0/24:tcp:1-1024`. Agent `<id>` in
-slot `<n>` gets:
-
-| what | name or address |
+| Command | State |
 |---|---|
-| namespace | `oc-<id>` |
-| veth, this machine's end | `ocv<n>`, `198.18.<n>.1/30` |
-| veth, the agent's end | `eth0`, `198.18.<n>.2/30` |
-| proxy port | `198.18.<n>.1`, TCP `18000+<n>` |
-| rules | chains, sets and a log limit named `*_<id>` in table `inet corral` |
-| record | `/run/corral/<id>` |
+| `corral version` | works |
+| `corral netns`, the network fence for one agent | checks its arguments; the commands are being built |
+| `corral run` and the client commands | not yet |
 
-Dropped traffic is logged to the kernel log with the prefix `corral-drop <id> `,
-at most 10 lines a second per agent.
+## Setup
 
-It needs `ip`, `nft`, `nsenter` and `setpriv` in `/usr/sbin`, `/usr/bin`,
-`/sbin` or `/bin`, and IPv4 forwarding (`net.ipv4.ip_forward = 1`), which it
-does not switch on itself. Installed as `/opt/corral/bin/corral`, a sudoers
-file lets the supervisor's user call it without a password; `!pam_session`
-keeps the launched command in that user's cgroup:
+corral is a single static binary for Linux. To build it you need Go 1.27 or
+newer.
 
-    Cmnd_Alias CORRAL_NETNS = /opt/corral/bin/corral netns *
-    Defaults!CORRAL_NETNS !pam_session
+```sh
+git clone https://github.com/txber/corral
+cd corral
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o corral ./cmd/corral
+sudo install -m 755 corral /usr/local/bin/corral
+```
 
-together with a line such as `you ALL=(root) NOPASSWD: CORRAL_NETNS`.
+Run the tests with `go test ./...`.
 
-What it does not do: it starts no sandbox and no proxy, resolves no host
-names, handles no IPv6 (an agent has none), changes no system setting, and
-keeps nothing across a reboot.
+## Use
+
+```sh
+corral version
+```
+
+This section grows as the commands above arrive.
 
 ## Integrations
 
-corral drives other tools through three small interfaces, defined in the
-package `integration` (`integration/integration.go`):
+corral does not confine or run anything itself. It drives three kinds of
+tool, each behind a small interface in the package `integration`:
 
-- `Sandbox` confines one agent process,
-- `KeyProxy` lets an agent use the model gateway without holding its key,
-- `Runtime` runs one agent program and speaks its control protocol.
+- a **sandbox** that confines one agent process,
+- a **runtime**, the agent program and its control protocol,
+- a **key proxy** that lets an agent use the model gateway without holding
+  its key.
 
-A tool is added by a Go package that implements one of them and registers a
-factory under a name from its `init` function; corral links the package in
-and builds the tool by the name its configuration gives.
+A tool is added by a Go package that implements one of the interfaces and
+registers itself under a name; the configuration then picks it by that name.
 
 ## License
 
-Apache-2.0, see `LICENSE`.
+Apache-2.0, see [LICENSE](LICENSE).

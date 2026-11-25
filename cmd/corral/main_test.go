@@ -20,6 +20,18 @@ func TestVersion(t *testing.T) {
 	}
 }
 
+func TestNetnsIsDispatchedBeforeAnythingElse(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"netns", "list"}, &stdout, &stderr)
+	want := "corral netns: list: not implemented\n"
+	if code != 1 || stderr.String() != want {
+		t.Errorf("run(netns list) = %d, %q; want 1, %q", code, stderr.String(), want)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty", stdout.String())
+	}
+}
+
 func TestUnknownSubcommandIsUsageError(t *testing.T) {
 	for _, args := range [][]string{nil, {"nonsense"}} {
 		var stdout, stderr bytes.Buffer

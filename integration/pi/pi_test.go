@@ -3,6 +3,8 @@ package pi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -605,19 +607,14 @@ func TestDecodeSettled(t *testing.T) {
 	}
 }
 
-func TestDecodeResponseCarriesItsData(t *testing.T) {
+func TestDecodeResponseCarriesItsDataWhole(t *testing.T) {
 	r := decode(t, `{"id":"req-1","type":"response","command":"bash","success":true,"data":{"output":"total 48\ndrwxr-xr-x ...","exitCode":0,"cancelled":false,"truncated":false}}`)
 	if r == nil || r.Kind != "response" || r.ID != "req-1" || !r.OK {
 		t.Fatalf("Decode = %+v, want a successful response to req-1", r)
 	}
-	want := map[string]any{"output": "total 48\ndrwxr-xr-x ...", "exitCode": 0.0, "cancelled": false, "truncated": false}
-	if len(r.Fields) != len(want) {
-		t.Errorf("Fields = %v, want %v", r.Fields, want)
-	}
-	for k, v := range want {
-		if r.Fields[k] != v {
-			t.Errorf("%s = %v, want %v", k, r.Fields[k], v)
-		}
+	data, _ := r.Fields["data"].(map[string]any)
+	if len(r.Fields) != 1 || data["output"] != "total 48\ndrwxr-xr-x ..." || data["exitCode"] != 0.0 {
+		t.Errorf("Fields = %v, want the data under data", r.Fields)
 	}
 }
 
@@ -631,13 +628,22 @@ func TestDecodeFailedResponseCarriesTheError(t *testing.T) {
 	}
 }
 
+func TestDecodeResponseErrorDoesNotOverwriteTheData(t *testing.T) {
+	r := decode(t, `{"id":"r1","type":"response","success":false,"error":"outer","data":{"error":"inner"}}`)
+	data, _ := r.Fields["data"].(map[string]any)
+	if r.Fields["error"] != "outer" || data["error"] != "inner" {
+		t.Errorf("Fields = %v, want error outer and data.error inner", r.Fields)
+	}
+}
+
 func TestDecodeStatsResponseKeepsTheTotals(t *testing.T) {
 	r := decode(t, `{"type":"response","id":"s1","command":"get_session_stats","success":true,"data":{"sessionFile":"/path/to/session.jsonl","sessionId":"abc123","userMessages":5,"assistantMessages":5,"toolCalls":12,"toolResults":12,"totalMessages":22,"tokens":{"input":50000,"output":10000,"cacheRead":40000,"cacheWrite":5000,"total":105000},"cost":0.45,"contextUsage":{"tokens":60000,"contextWindow":200000,"percent":30}}}`)
 	if r == nil || r.Kind != "response" || r.ID != "s1" {
 		t.Fatalf("Decode = %+v, want a response to s1", r)
 	}
-	tokens, _ := r.Fields["tokens"].(map[string]any)
-	if r.Fields["cost"] != 0.45 || tokens["total"] != 105000.0 {
+	data, _ := r.Fields["data"].(map[string]any)
+	tokens, _ := data["tokens"].(map[string]any)
+	if data["cost"] != 0.45 || tokens["total"] != 105000.0 {
 		t.Errorf("Fields = %v, want cost and tokens", r.Fields)
 	}
 }
@@ -656,9 +662,191 @@ func TestDecodeAcceptsACarriageReturnBeforeTheLF(t *testing.T) {
 	}
 }
 
+func TestDecodeRefusesAHostileUsage(t *testing.T) {
+	usages := []string{
+		`{"input":-5,"output":1e300,"cost":{"total":-100}}`,
+		`{"input":"5","output":1,"cost":{"total":0.1}}`,
+		`{"input":1.5,"output":1,"cost":{"total":0.1}}`,
+		`{"input":9007199254740994,"output":1,"cost":{"total":0.1}}`,
+		`{"input":1,"output":1,"cost":{"total":1e10}}`,
+		`{"input":1,"output":1,"cost":{"total":"0.1"}}`,
+		`{"input":1,"output":1,"cost":7}`,
+		`{"input":{},"output":1}`,
+		`"lots"`,
+	}
+	for _, u := range usages {
+		r := decode(t, `{"type":"message_end","message":{"role":"assistant","usage":`+u+`}}`)
+		if r == nil || r.Usage != nil || r.Fields["usage_refused"] != true {
+			t.Errorf("usage %s: Decode = %+v, want no Usage and usage_refused", u, r)
+		}
+	}
+}
+
+func TestDecodeRefusesAHostileCompactionUsage(t *testing.T) {
+	r := decode(t, `{"type":"compaction_end","reason":"threshold","result":{"usage":{"input":-5,"output":1,"cost":{"total":-100}}}}`)
+	if r == nil || r.Usage != nil || r.Fields["usage_refused"] != true {
+		t.Errorf("Decode = %+v, want no Usage and usage_refused", r)
+	}
+}
+
+func TestDecodeNeverTakesTheTypeFromTheLine(t *testing.T) {
+	for _, typ := range []string{`"approval"`, `"exit"`, `"agent_start\u001b[31m"`, `"AGENT_START"`, `" agent_start"`, `5`} {
+		r := decode(t, `{"type":`+typ+`}`)
+		if r == nil || r.Kind != "event" || r.Type != "other" {
+			t.Errorf("type %s: Decode = %+v, want event other", typ, r)
+		}
+	}
+}
+
+func TestDecodeToolKeepsOnlyPlainValues(t *testing.T) {
+	long := strings.Repeat("z", 1000)
+	r := decode(t, `{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","durationMs":{"a":[1,2,3,{"b":"`+long+`"}]},"isError":"yes"}`)
+	if _, ok := r.Fields["durationMs"]; ok {
+		t.Errorf("durationMs = %v, want it left out", r.Fields["durationMs"])
+	}
+	if _, ok := r.Fields["isError"]; ok {
+		t.Errorf("isError = %v, want it left out", r.Fields["isError"])
+	}
+}
+
+func TestDecodeToolLeavesOutANegativeDuration(t *testing.T) {
+	r := decode(t, `{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","durationMs":-1,"isError":true}`)
+	if _, ok := r.Fields["durationMs"]; ok || r.Fields["isError"] != true {
+		t.Errorf("Fields = %v, want isError and no durationMs", r.Fields)
+	}
+}
+
+func TestDecodeKeepsAtMost32PlainFields(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"type":"agent_end"`)
+	for i := range 40 {
+		fmt.Fprintf(&b, `,"k%02d":%d`, i, i)
+	}
+	b.WriteString("}")
+	r := decode(t, b.String())
+	if len(r.Fields) != 33 || r.Fields["truncated"] != true || r.Fields["k31"] != 31.0 || r.Fields["k32"] != nil {
+		t.Errorf("Fields = %v, want k00 to k31 and truncated", r.Fields)
+	}
+}
+
+func TestDecodeReplacesControlCharacters(t *testing.T) {
+	r := decode(t, `{"type":"extension_error","error":"a\u001b[31mb\u0007c\u2028d","k\u001b":"v"}`)
+	if got, want := r.Fields["error"], "a\uFFFD[31mb\uFFFDc\u2028d"; got != want {
+		t.Errorf("error = %q, want %q", got, want)
+	}
+	if r.Fields["k\uFFFD"] != "v" {
+		t.Errorf("Fields = %q, want the key cleaned as well", r.Fields)
+	}
+}
+
+func TestCutNeverSplitsACharacter(t *testing.T) {
+	got := cut("a" + strings.Repeat("\U0001D11E", 300)) // four bytes each
+	if n := utf8.RuneCountInString(got); n != 200 || strings.ContainsRune(got, utf8.RuneError) {
+		t.Errorf("cut gave %d characters (replacement character: %v), want 200 whole ones",
+			n, strings.ContainsRune(got, utf8.RuneError))
+	}
+}
+
+func TestPrepareRefusesALinkedFolderInTheWorkFolder(t *testing.T) {
+	rt := newTestRuntime(t, nil)
+	a := testAgent(t)
+	outside := t.TempDir()
+	if err := os.Chmod(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(a.Workdir, ".home")); err != nil {
+		t.Fatal(err)
+	}
+	err := rt.Prepare(a)
+	if err == nil || !strings.Contains(err.Error(), ".home") {
+		t.Errorf("Prepare error = %v, want a refusal naming .home", err)
+	}
+	if info, _ := os.Stat(outside); info.Mode().Perm() != 0o755 {
+		t.Errorf("the link's target has mode %v, want it untouched", info.Mode().Perm())
+	}
+}
+
+func TestPrepareRefusesALinkedConfigFolder(t *testing.T) {
+	rt := newTestRuntime(t, nil)
+	a := testAgent(t)
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(a.ShareDir, "pi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Prepare(a); err == nil || !strings.Contains(err.Error(), "pi") {
+		t.Errorf("Prepare error = %v, want a refusal naming the pi folder", err)
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Errorf("Prepare wrote %d entries through the link", len(entries))
+	}
+}
+
+func TestPrepareDoesNotWriteThroughALinkedModelsFile(t *testing.T) {
+	rt := newTestRuntime(t, nil)
+	a := testAgent(t)
+	outside := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(a.ShareDir, "pi"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(a.ShareDir, "pi", "models.json")); err != nil {
+		t.Fatal(err)
+	}
+	_ = rt.Prepare(a) // replacing the link or refusing are both fine
+	if data, _ := os.ReadFile(outside); string(data) != "keep" {
+		t.Errorf("the link's target now holds %q", data)
+	}
+	if info, _ := os.Stat(outside); info.Mode().Perm() != 0o644 {
+		t.Errorf("the link's target has mode %v, want it untouched", info.Mode().Perm())
+	}
+}
+
+func TestPrepareRefusesNamesThatLookLikeOptions(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		tools []any
+		word  string
+	}{
+		{"model", "--help", nil, "--help"},
+		{"tool", "example-model", []any{"read", "-x"}, "-x"},
+		{"empty tool", "example-model", []any{""}, "tools"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := newTestRuntime(t, nil)
+			a := testAgent(t)
+			a.Model = tt.model
+			if tt.tools != nil {
+				a.Options = map[string]any{"tools": tt.tools}
+			}
+			err := rt.Prepare(a)
+			if err == nil || !strings.Contains(err.Error(), tt.word) {
+				t.Errorf("Prepare error = %v, want a refusal naming %q", err, tt.word)
+			}
+		})
+	}
+}
+
+// decodedTypes are the only Type values Decode may return.
+var decodedTypes = []string{
+	"", "other", "response", "agent_settled", "message_end", "tool_execution_start", "tool_execution_end",
+	"agent_start", "agent_end", "turn_start", "turn_end", "extension_error",
+	"auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end",
+	"summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished",
+}
+
 func FuzzDecode(f *testing.F) {
 	f.Add([]byte(`{"type":"message_end","message":{"role":"assistant","usage":{"input":1,"cost":{"total":1}}}}`))
+	f.Add([]byte(`{"type":"message_end","message":{"role":"assistant","usage":{"input":-5,"output":1e300,"cost":{"total":-100}}}}`))
+	f.Add([]byte(`{"type":"message_end","message":{"role":"assistant","usage":{"input":"5","cost":[1]}}}`))
+	f.Add([]byte(`{"type":"compaction_end","result":{"usage":{"input":1.5,"cost":{"total":1e12}}}}`))
 	f.Add([]byte(`{"type":"tool_execution_start","args":{"a":"b"}}`))
+	f.Add([]byte(`{"type":"tool_execution_end","durationMs":{"a":[1,2,3]},"isError":"yes"}`))
+	f.Add([]byte(`{"type":"agent_end","a":1,"b":2,"c":3,"d":4,"e":5,"f":6,"g":7,"h":8,"i":9,"j":10,"k":11,"l":12,"m":13,"n":14,"o":15,"p":16,"q":17,"r":18,"s":19,"t":20,"u":21,"v":22,"w":23,"x":24,"y":25,"z":26,"A":27,"B":28,"C":29,"D":30,"E":31,"F":32,"G":33,"H":34}`))
+	f.Add([]byte(`{"type":"extension_error","error":"\u001b[2J\u0007","\u001b]0;x":"y"}`))
 	f.Add([]byte(`{"type":"response","data":[1]}`))
 	f.Add([]byte("\xff\xfe"))
 	rt, err := integration.NewRuntime("pi", map[string]any{"binary": testBinary})
@@ -667,11 +855,38 @@ func FuzzDecode(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, line []byte) {
 		r := rt.Decode(line)
-		if r == nil || r.Kind != "garbage" {
+		if r == nil {
 			return
 		}
-		if text, _ := r.Fields["text"].(string); utf8.RuneCountInString(text) > 200 {
-			t.Errorf("garbage text has %d characters", utf8.RuneCountInString(text))
+		if !slices.Contains(decodedTypes, r.Type) {
+			t.Errorf("Type %q is not from the fixed list", r.Type)
+		}
+		if u := r.Usage; u != nil {
+			if u.Input < 0 || u.Output < 0 || u.CacheRead < 0 || u.CacheWrite < 0 ||
+				u.Cost < 0 || math.IsNaN(u.Cost) || math.IsInf(u.Cost, 0) {
+				t.Errorf("Usage = %+v", *u)
+			}
+		}
+		if r.Kind == "response" {
+			return // a response's data goes back whole to whoever sent the command
+		}
+		if len(r.Fields) > 34 {
+			t.Errorf("%d fields", len(r.Fields))
+		}
+		for k, v := range r.Fields {
+			switch v := v.(type) {
+			case string:
+				if utf8.RuneCountInString(v) > 200 {
+					t.Errorf("field %q has %d characters", k, utf8.RuneCountInString(v))
+				}
+			case bool:
+			case float64:
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					t.Errorf("field %q = %v", k, v)
+				}
+			default:
+				t.Errorf("field %q has type %T", k, v)
+			}
 		}
 	})
 }

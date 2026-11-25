@@ -13,12 +13,17 @@ package pi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/txber/corral/integration"
 )
@@ -121,8 +126,9 @@ func roleOptions(options map[string]any) (thinking string, tools []string, err e
 		}
 		for _, item := range list {
 			name, ok := item.(string)
-			// pi takes the tools as one comma-separated argument.
-			if !ok || name == "" || strings.Contains(name, ",") {
+			// pi takes the tools as one comma-separated argument, and a name
+			// that starts with "-" would be read as an option.
+			if !ok || name == "" || strings.HasPrefix(name, "-") || strings.Contains(name, ",") {
 				return "", nil, fmt.Errorf("pi: role option tools holds a bad tool name %v", item)
 			}
 			tools = append(tools, name)
@@ -169,24 +175,35 @@ func (p *program) Prepare(a integration.Agent) error {
 	if a.Model == "" || a.GatewayURL == "" {
 		return fmt.Errorf("pi: agent %s has no model or no gateway address", a.ID)
 	}
+	// The model name follows --model; one that starts with "-" would be read
+	// as an option.
+	if strings.HasPrefix(a.Model, "-") {
+		return fmt.Errorf("pi: model name %q must not start with -", a.Model)
+	}
 	if a.ShareDir == "" || a.Workdir == "" {
 		return fmt.Errorf("pi: agent %s has no share folder or no working folder", a.ID)
 	}
-	configDir := filepath.Join(a.ShareDir, "pi")
-	dirs := []string{
-		configDir,
-		filepath.Join(a.Workdir, ".home"),
-		filepath.Join(a.Workdir, ".tmp"),
-		filepath.Join(a.Workdir, ".sessions"),
+	// The agent can write the working folder and may have left symbolic
+	// links there from an earlier run, so every folder is made through an
+	// os.Root, which refuses a path that leaves it, and must be a plain
+	// folder before its mode is set.
+	work, err := os.OpenRoot(a.Workdir)
+	if err != nil {
+		return fmt.Errorf("pi: %w", err)
 	}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("pi: %w", err)
+	defer work.Close()
+	for _, name := range []string{".home", ".tmp", ".sessions"} {
+		if err := privateDir(work, name); err != nil {
+			return err
 		}
-		// MkdirAll leaves the mode of a folder that already exists alone.
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return fmt.Errorf("pi: %w", err)
-		}
+	}
+	share, err := os.OpenRoot(a.ShareDir)
+	if err != nil {
+		return fmt.Errorf("pi: %w", err)
+	}
+	defer share.Close()
+	if err := privateDir(share, "pi"); err != nil {
+		return err
 	}
 	doc := modelsFile{Providers: map[string]provider{
 		"gateway": {
@@ -207,13 +224,47 @@ func (p *program) Prepare(a integration.Agent) error {
 	if err != nil {
 		return fmt.Errorf("pi: models.json: %w", err)
 	}
-	path := filepath.Join(configDir, "models.json")
-	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+	return writeNew(share, filepath.Join("pi", "models.json"), append(data, '\n'))
+}
+
+// privateDir makes name below root a plain folder with mode 700, creating it
+// if needed and refusing a symbolic link or anything else in its place.
+func privateDir(root *os.Root, name string) error {
+	path := filepath.Join(root.Name(), name)
+	if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("pi: %w", err)
 	}
-	// WriteFile leaves the mode of a file that already exists alone.
-	if err := os.Chmod(path, 0o600); err != nil {
+	info, err := root.Lstat(name)
+	if err != nil {
 		return fmt.Errorf("pi: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("pi: %s is not a plain folder", path)
+	}
+	// Mkdir leaves the mode of a folder that already exists alone.
+	if err := root.Chmod(name, 0o700); err != nil {
+		return fmt.Errorf("pi: %w", err)
+	}
+	return nil
+}
+
+// writeNew writes data to a new file name below root with mode 600. Whatever
+// was there before is removed first, so a symbolic link is replaced and
+// never written through.
+func writeNew(root *os.Root, name string, data []byte) error {
+	if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("pi: %w", err)
+	}
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("pi: %w", err)
+	}
+	_, err = f.Write(data)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("pi: %s: %w", name, err)
 	}
 	return nil
 }
@@ -324,16 +375,23 @@ var passedOn = []string{
 // form arrives in another record, so they are not logged.
 var streaming = []string{"message_start", "message_update", "tool_execution_update", "bash_execution_update"}
 
-// Decode turns one line of pi's output into a record for corral.
+// maxFields is how many plain fields of one record are kept.
+const maxFields = 32
+
+// Decode turns one line of pi's output into a record for corral. The line
+// comes from the agent and may be hostile: the record's Type is always one
+// of the names in this file, and every field of an event is a cut string, a
+// bool or a finite number.
 func (p *program) Decode(line []byte) *integration.Record {
 	var rec map[string]any
 	if err := json.Unmarshal(line, &rec); err != nil || rec == nil {
 		return &integration.Record{Kind: "garbage", Fields: map[string]any{"text": cut(string(line))}}
 	}
 	typ, _ := rec["type"].(string)
+	// Below, typ is used as a Type only where it equals a name of a fixed list.
 	switch {
 	case typ == "agent_settled":
-		return &integration.Record{Kind: "settled", Type: typ, Fields: plainFields(rec)}
+		return &integration.Record{Kind: "settled", Type: "agent_settled", Fields: plainFields(rec)}
 	case typ == "response":
 		return decodeResponse(rec)
 	case typ == "message_end":
@@ -344,8 +402,10 @@ func (p *program) Decode(line []byte) *integration.Record {
 		return nil
 	case slices.Contains(passedOn, typ):
 		r := &integration.Record{Kind: "event", Type: typ, Fields: plainFields(rec)}
-		if result, ok := rec["result"].(map[string]any); ok && typ == "compaction_end" {
-			r.Usage = usage(result["usage"]) // the model calls that wrote the summary
+		if typ == "compaction_end" {
+			// The model calls that wrote the summary.
+			result, _ := rec["result"].(map[string]any)
+			addUsage(r, result["usage"])
 		}
 		return r
 	default:
@@ -353,17 +413,13 @@ func (p *program) Decode(line []byte) *integration.Record {
 	}
 }
 
-// decodeResponse returns pi's answer to one command: its data for the
-// requester, and the error when the command failed.
+// decodeResponse returns pi's answer to one command. Its data goes back
+// whole to whoever sent the command, so it is not cut.
 func decodeResponse(rec map[string]any) *integration.Record {
 	id, _ := rec["id"].(string)
 	ok, _ := rec["success"].(bool)
 	fields := map[string]any{}
-	switch data := rec["data"].(type) {
-	case map[string]any:
-		fields = data
-	case nil:
-	default:
+	if data, has := rec["data"]; has && data != nil {
 		fields["data"] = data
 	}
 	if text, isText := rec["error"].(string); isText {
@@ -382,7 +438,9 @@ func decodeMessageEnd(rec map[string]any) *integration.Record {
 			fields[key] = cut(text)
 		}
 	}
-	return &integration.Record{Kind: "event", Type: "message_end", Fields: fields, Usage: usage(msg["usage"])}
+	r := &integration.Record{Kind: "event", Type: "message_end", Fields: fields}
+	addUsage(r, msg["usage"])
+	return r
 }
 
 // decodeTool returns the start or end of one tool call with the tool's name
@@ -394,10 +452,11 @@ func decodeTool(typ string, rec map[string]any) *integration.Record {
 			fields[key] = cut(text)
 		}
 	}
-	for _, key := range []string{"isError", "durationMs"} {
-		if value, ok := rec[key]; ok {
-			fields[key] = value
-		}
+	if isError, ok := rec["isError"].(bool); ok {
+		fields["isError"] = isError
+	}
+	if ms, ok := rec["durationMs"].(float64); ok && ms >= 0 && !math.IsInf(ms, 0) {
+		fields["durationMs"] = ms
 	}
 	if args, ok := rec["args"]; ok {
 		text, _ := json.Marshal(args) // it came from JSON, so it goes back
@@ -407,48 +466,124 @@ func decodeTool(typ string, rec map[string]any) *integration.Record {
 }
 
 // plainFields returns the strings, numbers and booleans of a record except
-// its type, leaving out nested messages and results.
+// its type, leaving out nested messages and results. It keeps the first
+// maxFields of them in key order and marks the record "truncated" when it
+// left some out.
 func plainFields(rec map[string]any) map[string]any {
 	fields := map[string]any{}
-	for key, value := range rec {
-		switch v := value.(type) {
+	kept := 0
+	for _, key := range sortedKeys(rec) {
+		var value any
+		switch v := rec[key].(type) {
 		case string:
-			if key != "type" {
-				fields[key] = cut(v)
+			if key == "type" {
+				continue
 			}
-		case float64, bool:
-			fields[key] = v
+			value = cut(v)
+		case float64, bool: // a JSON number is always finite
+			value = v
+		default:
+			continue
 		}
+		if kept == maxFields {
+			fields["truncated"] = true
+			break
+		}
+		fields[cut(key)] = value
+		kept++
 	}
 	return fields
 }
 
-// usage reads pi's Usage object, or returns nil when there is none.
-func usage(value any) *integration.Usage {
-	u, ok := value.(map[string]any)
-	if !ok {
-		return nil
+// Bounds on the usage that corral accepts; a token count above 1<<53 cannot
+// be held exactly in a JSON number.
+const (
+	maxTokens = 1 << 53
+	maxCost   = 1e9
+)
+
+// addUsage puts pi's Usage object on r. The numbers come from the agent and
+// feed corral's spend totals, so a usage is refused, and the record marked
+// "usage_refused", unless every count is a whole number from 0 to maxTokens
+// and the cost a number from 0 to maxCost. A missing number counts as 0.
+func addUsage(r *integration.Record, value any) {
+	if value == nil {
+		return
 	}
-	tokens := func(key string) int64 {
-		n, _ := u[key].(float64)
-		return int64(n)
+	u, refused := readUsage(value)
+	if refused {
+		r.Fields["usage_refused"] = true
+		return
 	}
-	c, _ := u["cost"].(map[string]any)
-	total, _ := c["total"].(float64)
-	return &integration.Usage{
-		Input:      tokens("input"),
-		Output:     tokens("output"),
-		CacheRead:  tokens("cacheRead"),
-		CacheWrite: tokens("cacheWrite"),
-		Cost:       total,
-	}
+	r.Usage = u
 }
 
-// cut returns the first maxText characters of s.
-func cut(s string) string {
-	runes := []rune(s)
-	if len(runes) <= maxText {
-		return s
+// readUsage reads a Usage object, or reports it refused.
+func readUsage(value any) (u *integration.Usage, refused bool) {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return nil, true
 	}
-	return string(runes[:maxText])
+	counts := make([]int64, 4)
+	for i, key := range []string{"input", "output", "cacheRead", "cacheWrite"} {
+		n, ok := number(obj, key, maxTokens)
+		if !ok || n != math.Trunc(n) {
+			return nil, true
+		}
+		counts[i] = int64(n)
+	}
+	total := 0.0
+	if c, has := obj["cost"]; has {
+		costs, ok := c.(map[string]any)
+		if !ok {
+			return nil, true
+		}
+		if total, ok = number(costs, "total", maxCost); !ok {
+			return nil, true
+		}
+	}
+	return &integration.Usage{
+		Input: counts[0], Output: counts[1], CacheRead: counts[2], CacheWrite: counts[3],
+		Cost: total,
+	}, false
+}
+
+// number returns obj[key] if it is a number from 0 to limit, and 0 if it is
+// missing.
+func number(obj map[string]any, key string, limit float64) (float64, bool) {
+	value, has := obj[key]
+	if !has {
+		return 0, true
+	}
+	n, ok := value.(float64)
+	if !ok || math.IsNaN(n) || n < 0 || n > limit {
+		return 0, false
+	}
+	return n, true
+}
+
+// cut returns the first maxText characters of s, with every control
+// character replaced by U+FFFD so that nothing printing the text can be
+// steered by it. It looks at no more than the bytes maxText characters can
+// take, and never splits a character.
+func cut(s string) string {
+	if limit := maxText * utf8.UTFMax; len(s) > limit {
+		for limit > 0 && !utf8.RuneStart(s[limit]) {
+			limit--
+		}
+		s = s[:limit]
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if n == maxText {
+			break
+		}
+		if unicode.IsControl(r) {
+			r = utf8.RuneError
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String()
 }

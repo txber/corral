@@ -100,10 +100,10 @@ type Usage struct {
 
 // Record is one line of a runtime's output, in corral's terms.
 type Record struct {
-	Kind   string // "event", "response", "settled" or "garbage"
-	Type   string // event type for the log
-	Fields map[string]any
-	ID     string // for a response: the id passed to Encode
+	Kind   string         // "event", "response", "settled" or "garbage"
+	Type   string         // a name from the integration's own fixed list, never text taken from the agent's output
+	Fields map[string]any // what the agent program reported; corral logs it nested under one key, apart from its own fields
+	ID     string         // for a response: the id passed to Encode
 	OK     bool
 	Usage  *Usage // tokens and cost, when the record carries them
 }

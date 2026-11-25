@@ -451,6 +451,50 @@ func TestStringValuesKeepLineBreaksAndControlCharacters(t *testing.T) {
 	}
 }
 
+type label string
+
+func TestValuesOfOtherTypesAreRefused(t *testing.T) {
+	deep := []map[string]any{{"k": nested("s", "k", 40)}}
+	for _, value := range []any{
+		[]string{"a\xff"},
+		map[string]string{"a\xff": "1", "a\xfe": "2"},
+		map[string]string{"k\n": "v"},
+		map[string][]any{"k": {"v"}},
+		deep,
+		label("a\xff"),
+		json.RawMessage(`"a` + "\xff" + `"`),
+		errors.New("boom"),
+		[]any{[]string{"ok"}},
+	} {
+		l, path := openLog(t)
+		_, err := l.Write("x", "", "", map[string]any{"f": value})
+		if err == nil {
+			t.Errorf("value of type %T was accepted", value)
+		} else if !strings.Contains(err.Error(), `"f"`) {
+			t.Errorf("error does not name the field: %v", err)
+		}
+		if data, _ := os.ReadFile(path); len(data) != 0 {
+			t.Errorf("refused value of type %T left data in the file: %q", value, data)
+		}
+	}
+}
+
+func TestValuesLikeDecodedJSONAreAccepted(t *testing.T) {
+	l, path := openLog(t)
+	fields := map[string]any{
+		"b": true, "f": 1.5, "i": 7, "i64": int64(-8), "n": nil, "s": "text",
+		"list": []any{"a", 1, false}, "map": map[string]any{"k": []any{nil}},
+	}
+	if _, err := l.Write("x", "", "", fields); err != nil {
+		t.Fatal(err)
+	}
+	line := readLines(t, path)[0]
+	want := `"b":true,"f":1.5,"i":7,"i64":-8,"list":["a",1,false],"map":{"k":[null]},"n":null,"s":"text"}`
+	if !strings.HasSuffix(line, want) {
+		t.Errorf("line = %s, want suffix %s", line, want)
+	}
+}
+
 func TestOpenRefusesAJobNameWithInvalidText(t *testing.T) {
 	for _, job := range []string{"j\xff", "j\n", "j\x7f"} {
 		path := filepath.Join(t.TempDir(), "events.jsonl")

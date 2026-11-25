@@ -98,13 +98,18 @@ func lastSeq(data []byte) int {
 // written as null. The record's fixed fields come first, in a fixed order,
 // followed by the caller's fields sorted by name.
 //
+// A field value is made of what decoded JSON is made of: nil, a bool, an int,
+// int64 or float64, a string, a []any or a map[string]any. Other types, such
+// as []string or map[string]string, are refused; convert them first.
+//
 // Write refuses a record rather than change it, so that the line in the file
 // always reads back as the record returned; the caller decides what to write
-// instead. It refuses a field named like a fixed field in any case; a name
-// (type, agent id, role, field name or key of a nested map) that is not valid
-// UTF-8 or holds a control character; a string value that is not valid UTF-8;
-// a number that is NaN or infinite; and a value nested deeper than 32 levels
-// of maps and slices. A refused record writes nothing and uses no seq.
+// instead. It refuses a field named like a fixed field in any case; a value of
+// another type; a name (type, agent id, role, field name or key of a nested
+// map) that is not valid UTF-8 or holds a control character; a string value
+// that is not valid UTF-8; a number that is NaN or infinite; and a value
+// nested deeper than 32 levels of maps and slices. A refused record writes
+// nothing and uses no seq.
 func (l *Log) Write(typ, agentID, role string, fields map[string]any) (map[string]any, error) {
 	for _, fixed := range []struct{ what, value string }{{"type", typ}, {"agent id", agentID}, {"role", role}} {
 		if err := checkName(fixed.value); err != nil {
@@ -189,10 +194,11 @@ func checkField(name string, value any) error {
 }
 
 // checkValue returns why value, depth levels down in a field, cannot be
-// written as it is, or nil. It looks into the maps and slices that decoded
-// JSON is made of; numbers that JSON cannot hold are left to the encoder.
+// written as it is, or nil. Numbers that JSON cannot hold are left to the
+// encoder.
 func checkValue(value any, depth int) error {
 	switch v := value.(type) {
+	case nil, bool, int, int64, float64:
 	case string:
 		if !utf8.ValidString(v) {
 			return errors.New("a string value is not valid UTF-8")
@@ -218,6 +224,8 @@ func checkValue(value any, depth int) error {
 				return err
 			}
 		}
+	default:
+		return fmt.Errorf("a value of type %T is not supported", value)
 	}
 	return nil
 }
@@ -252,11 +260,6 @@ func encode(record map[string]any, names []string) ([]byte, error) {
 		buf.Write(value)
 	}
 	buf.WriteString("}\n")
-	// A value that checkValue does not look into, such as a json.RawMessage,
-	// can still nest too deeply for encoding/json to read the line back.
-	if !json.Valid(buf.Bytes()) {
-		return nil, errors.New("record does not read back as JSON")
-	}
 	return buf.Bytes(), nil
 }
 

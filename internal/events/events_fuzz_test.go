@@ -113,6 +113,8 @@ func FuzzWrite(f *testing.F) {
 	f.Add("j", "x", "a", "r", "deep", "k\n", "s", 1.0, byte(2), byte(4))
 	f.Add("j", "x", "", "", "pad", "k", "s", math.NaN(), byte(1), byte(0))
 	f.Add("j", "x", "", "", "pad", "k", "s", math.Inf(-1), byte(1), byte(0))
+	f.Add("j", "x", "", "", "f", "a\xff", "a\xfe", 1.0, byte(4), byte(0))
+	f.Add("j", "x", "", "", "f", "k", "ok", 1.0, byte(4), byte(0))
 	f.Add("Grüße", "日本", "<ok>", "&", "k\"\\", " ", "v\n\r\t\x00</script>", -0.0, byte(2), byte(9))
 
 	f.Fuzz(func(t *testing.T, job, typ, agentID, role, name, key, s string, num float64, kind, depth byte) {
@@ -137,7 +139,7 @@ func FuzzWrite(f *testing.F) {
 
 		var value any
 		valueBad := false
-		switch kind % 4 {
+		switch kind % 5 {
 		case 0:
 			value, valueBad = s, !utf8.ValidString(s)
 		case 1:
@@ -146,8 +148,11 @@ func FuzzWrite(f *testing.F) {
 			// From two levels on, the value holds a map with key.
 			value = nested(s, key, int(depth))
 			valueBad = !utf8.ValidString(s) || depth > maxDepth || depth >= 2 && badName(key)
-		default:
+		case 3:
 			value = nil
+		default:
+			// Only the types that decoded JSON is made of are written.
+			value, valueBad = map[string][]string{key: {s}}, true
 		}
 		fields := map[string]any{"n": 1}
 		fields[name] = value
@@ -186,6 +191,9 @@ func FuzzWrite(f *testing.F) {
 			}
 			if _, ok := line[name]; !ok {
 				t.Fatalf("field %q is missing: %v", name, line)
+			}
+			if kind%5 == 0 && line[name] != s {
+				t.Fatalf("field %q = %q, want %q", name, line[name], s)
 			}
 		}
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 
+	_ "github.com/txber/corral/integration/pi"
 	"github.com/txber/corral/internal/netns"
 )
 

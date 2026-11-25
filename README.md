@@ -88,6 +88,8 @@ tool, each behind a small interface in the package `integration`:
 A tool is added by a Go package that implements one of the interfaces and
 registers itself under a name; the configuration then picks it by that name.
 
+A runtime for the coding agent pi is built in and registered as `pi`.
+
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE).

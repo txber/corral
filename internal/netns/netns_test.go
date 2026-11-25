@@ -266,20 +266,12 @@ func TestBadArgumentsExitTwoAndNameTheArgument(t *testing.T) {
 	}
 }
 
-func TestValidCommandsAreNotImplementedYet(t *testing.T) {
-	for _, args := range [][]string{
-		{"up", "w1", "7"},
-		{"allow", "w1", "7", "--target", "10.10.4.7:udp:53"},
-		{"exec", "w1", "--env-file", "/run/e", "--", "agent"},
-		{"down", "w1", "7"},
-		{"list"},
-	} {
-		var stdout, stderr bytes.Buffer
-		code := Main(args, &stdout, &stderr)
-		want := "corral netns: " + args[0] + ": not implemented\n"
-		if code != 1 || stderr.String() != want {
-			t.Errorf("Main(%q) = %d, %q; want 1, %q", args, code, stderr.String(), want)
-		}
+func TestExecWithoutSudoIsRefused(t *testing.T) {
+	t.Setenv("SUDO_UID", "")
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"exec", "w1", "--env-file", "/run/e", "--", "agent"}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "SUDO_UID") {
+		t.Errorf("Main(exec) = %d, %q; want 1 and a word about SUDO_UID", code, stderr.String())
 	}
 }
 

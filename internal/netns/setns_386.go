@@ -1,0 +1,5 @@
+package netns
+
+// sysSetns is the number of the setns system call, which package syscall
+// does not name on 386.
+const sysSetns = 346

@@ -8,7 +8,8 @@
 // package uses the standard library only.
 //
 // This file holds the naming scheme and the command line; rules.go renders
-// the nftables text.
+// the nftables text, system.go runs the commands, state.go keeps a record
+// of each agent and envfile.go reads the environment of a launched command.
 package netns
 
 import (
@@ -65,8 +66,11 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "corral netns: %v\n\n%s", err, usage)
 		return 2
 	}
-	fmt.Fprintf(stderr, "corral netns: %s: not implemented\n", c.name)
-	return 1
+	if err := execute(c, stdout); err != nil {
+		fmt.Fprintf(stderr, "corral netns: %s: %v\n", c.name, err)
+		return 1
+	}
+	return 0
 }
 
 // Target is one network target: an IPv4 network, a protocol and a port range.
@@ -75,6 +79,20 @@ type Target struct {
 	Network     netip.Prefix // a single host is a /32
 	Proto       string       // "tcp" or "udp"
 	First, Last uint16
+}
+
+// String returns the text form parseTarget reads: the address alone for a
+// single host, the port alone for a single port.
+func (t Target) String() string {
+	address := t.Network.String()
+	if t.Network.IsSingleIP() {
+		address = t.Network.Addr().String()
+	}
+	ports := strconv.Itoa(int(t.First))
+	if t.Last != t.First {
+		ports += "-" + strconv.Itoa(int(t.Last))
+	}
+	return address + ":" + t.Proto + ":" + ports
 }
 
 // valid reports whether t is a target parseTarget could have returned. The

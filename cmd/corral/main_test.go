@@ -22,10 +22,11 @@ func TestVersion(t *testing.T) {
 
 func TestNetnsIsDispatchedBeforeAnythingElse(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"netns", "list"}, &stdout, &stderr)
-	want := "corral netns: list: not implemented\n"
-	if code != 1 || stderr.String() != want {
-		t.Errorf("run(netns list) = %d, %q; want 1, %q", code, stderr.String(), want)
+	// A bad netns command line gets the helper's own message and usage.
+	code := run([]string{"netns", "list", "extra"}, &stdout, &stderr)
+	want := "corral netns: list takes no arguments\n"
+	if code != 2 || !strings.HasPrefix(stderr.String(), want) {
+		t.Errorf("run(netns list extra) = %d, %q; want 2 and a message starting %q", code, stderr.String(), want)
 	}
 	if stdout.Len() != 0 {
 		t.Errorf("stdout = %q, want empty", stdout.String())

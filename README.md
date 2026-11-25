@@ -44,12 +44,71 @@ in that setup's configuration or in an integration.
 
 ## Status
 
-Early. So far only `corral version` runs; the parts are added one by one.
+Early. So far `corral version` and `corral netns` run; the parts are added
+one by one.
 
 ## Build and test
 
     CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o corral ./cmd/corral
     go test ./...
+
+## Network namespaces: `corral netns`
+
+`corral netns` gives each agent a network namespace of its own and firewall
+rules that let it reach only its targets and one proxy port on this machine.
+It runs as root through sudo and can be used on its own:
+
+    corral netns up    <agent_id> <slot> [--target <target>]...
+    corral netns allow <agent_id> <slot> --target <target> [--target <target>]...
+    corral netns exec  <agent_id> --env-file <path> -- <command> [<arg>...]
+    corral netns down  <agent_id> <slot>
+    corral netns list
+
+- `up` creates the namespace, a veth pair joining it to this machine and the
+  agent's rules. It refuses an agent id or a slot that is in use, and removes
+  what it created when a step fails.
+- `allow` adds targets to a running agent; open connections stay open.
+- `exec` runs a command inside the namespace as the user who called sudo,
+  without capabilities, and with exactly the variables of the env file as its
+  environment. The env file must belong to that user, have mode 600, hold at
+  most 64 lines of `KEY=VALUE` and be no larger than 64 KiB; variables that
+  would change how the launching tools run as root, such as `LD_PRELOAD`,
+  are refused.
+- `down` stops what runs in the namespace and removes the namespace, the veth
+  pair and the rules. It succeeds when there is nothing left to remove.
+- `list` prints one `<agent_id> <slot>` line per agent.
+
+An agent id is a lowercase letter and up to 11 lowercase letters or digits, a
+slot a number from 1 to 250, and a target `<ip[/prefix]>:<tcp|udp>:<port[-port]>`,
+for example `192.0.2.7:udp:53` or `10.10.4.0/24:tcp:1-1024`. Agent `<id>` in
+slot `<n>` gets:
+
+| what | name or address |
+|---|---|
+| namespace | `oc-<id>` |
+| veth, this machine's end | `ocv<n>`, `198.18.<n>.1/30` |
+| veth, the agent's end | `eth0`, `198.18.<n>.2/30` |
+| proxy port | `198.18.<n>.1`, TCP `18000+<n>` |
+| rules | chains, sets and a log limit named `*_<id>` in table `inet corral` |
+| record | `/run/corral/<id>` |
+
+Dropped traffic is logged to the kernel log with the prefix `corral-drop <id> `,
+at most 10 lines a second per agent.
+
+It needs `ip`, `nft`, `nsenter` and `setpriv` in `/usr/sbin`, `/usr/bin`,
+`/sbin` or `/bin`, and IPv4 forwarding (`net.ipv4.ip_forward = 1`), which it
+does not switch on itself. Installed as `/opt/corral/bin/corral`, a sudoers
+file lets the supervisor's user call it without a password; `!pam_session`
+keeps the launched command in that user's cgroup:
+
+    Cmnd_Alias CORRAL_NETNS = /opt/corral/bin/corral netns *
+    Defaults!CORRAL_NETNS !pam_session
+
+together with a line such as `you ALL=(root) NOPASSWD: CORRAL_NETNS`.
+
+What it does not do: it starts no sandbox and no proxy, resolves no host
+names, handles no IPv6 (an agent has none), changes no system setting, and
+keeps nothing across a reboot.
 
 ## Integrations
 

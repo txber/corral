@@ -344,41 +344,33 @@ func checkRequest(req *http.Request) error {
 // parseBody reads {"backend": ..., "request": {...}}. It also returns what
 // the body says about itself, for the report of a later denial.
 func parseBody(body []byte) (integration.Request, map[string]any, error) {
-	if !json.Valid(body) {
+	var message map[string]json.RawMessage
+	err := json.Unmarshal(body, &message)
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
 		return integration.Request{}, nil, reject(http.StatusBadRequest, "body is not valid JSON")
 	}
-	var message map[string]json.RawMessage
-	if err := json.Unmarshal(body, &message); err != nil || message == nil {
+	if err != nil || message == nil {
 		return integration.Request{}, nil, reject(http.StatusBadRequest, "body is not a JSON object")
 	}
+	request, err := parseRequest(message["request"])
 	context := map[string]any{}
+	if request.Kind != "" {
+		context["kind"] = request.Kind
+	}
+	if request.ID != "" {
+		context["request_id"] = request.ID
+	}
 	var backend *string
 	if json.Unmarshal(message["backend"], &backend) == nil && backend != nil {
 		context["backend"] = *backend
+	} else if err == nil {
+		err = errors.New("'backend' is not a string")
 	}
-	var about struct {
-		Type *string `json:"capability_type"`
-		ID   *string `json:"request_id"`
-	}
-	if json.Unmarshal(message["request"], &about) == nil {
-		if about.Type != nil {
-			context["kind"] = kindOf(*about.Type)
-		}
-		if about.ID != nil {
-			context["request_id"] = *about.ID
-		}
-	}
-	fail := func(format string, args ...any) (integration.Request, map[string]any, error) {
-		r := reject(http.StatusBadRequest, format, args...)
+	if err != nil {
+		r := reject(http.StatusBadRequest, "%.300v", err)
 		r.context = context
 		return integration.Request{}, context, r
-	}
-	if _, ok := context["backend"]; !ok {
-		return fail("'backend' is not a string")
-	}
-	request, err := parseRequest(message["request"])
-	if err != nil {
-		return fail("%.300v", err)
 	}
 	return request, context, nil
 }
@@ -397,7 +389,8 @@ func kindOf(capabilityType string) string {
 // parseRequest turns nono's request object into corral's request. A file
 // request ("capability") needs path and access, a network request needs
 // host, port and the addresses nono resolved; every other type becomes
-// "other" with the type as its detail.
+// "other" with the type as its detail. With an error it still returns the
+// kind and id it read, for the report of the denial.
 func parseRequest(raw json.RawMessage) (integration.Request, error) {
 	var fields struct {
 		Path        *string   `json:"path"`
@@ -427,25 +420,25 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 		return r, nil
 	case "path":
 		if err := json.Unmarshal(raw, &fields); err != nil {
-			return integration.Request{}, fmt.Errorf("file request: %w", err)
+			return r, fmt.Errorf("file request: %w", err)
 		}
 		if fields.Path == nil || fields.Access == nil {
-			return integration.Request{}, errors.New("file request needs the strings path and access")
+			return r, errors.New("file request needs the strings path and access")
 		}
 		r.Path, r.Access = *fields.Path, *fields.Access
 	case "network":
 		if err := json.Unmarshal(raw, &fields); err != nil {
-			return integration.Request{}, fmt.Errorf("network request: %w", err)
+			return r, fmt.Errorf("network request: %w", err)
 		}
 		if fields.Host == nil || fields.Port == nil || fields.ResolvedIPs == nil {
-			return integration.Request{}, errors.New("network request needs host, port and resolved_ips")
+			return r, errors.New("network request needs host, port and resolved_ips")
 		}
 		// The scope is checked for tcp; nono's proxy only asks about tcp.
 		if fields.Protocol != nil && *fields.Protocol != "tcp" {
-			return integration.Request{}, fmt.Errorf("network request protocol %.20q is not tcp", *fields.Protocol)
+			return r, fmt.Errorf("network request protocol %.20q is not tcp", *fields.Protocol)
 		}
 		if *fields.Port < 1 || *fields.Port > 65535 {
-			return integration.Request{}, fmt.Errorf("network request port %d is out of range", *fields.Port)
+			return r, fmt.Errorf("network request port %d is out of range", *fields.Port)
 		}
 		r.Host, r.Port, r.Addresses = *fields.Host, *fields.Port, *fields.ResolvedIPs
 	}
@@ -456,23 +449,11 @@ func parseRequest(raw json.RawMessage) (integration.Request, error) {
 // gives it, minus a margin, so that the answer arrives before nono stops
 // waiting.
 func handlerBudget(header string) time.Duration {
-	seconds := defaultTimeoutSecs
-	if isDigits(header) && len(header) <= 6 {
-		seconds, _ = strconv.Atoi(header)
+	seconds := uint64(defaultTimeoutSecs)
+	if n, err := strconv.ParseUint(header, 10, 20); err == nil {
+		seconds = n
 	}
-	return time.Duration(max(0, seconds-timeoutMarginSecs)) * time.Second
-}
-
-func isDigits(text string) bool {
-	if text == "" {
-		return false
-	}
-	for _, c := range text {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
+	return time.Duration(max(0, int(seconds)-timeoutMarginSecs)) * time.Second
 }
 
 // decideWithin runs decide and gives up after budget. A decide call that

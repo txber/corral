@@ -38,8 +38,9 @@ func testAgent(t *testing.T) integration.Agent {
 		Model:        "example-model",
 		Options:      map[string]any{},
 		Cost:         integration.Cost{Input: 1.5, Output: 4.5, CacheRead: 0.3, CacheWrite: 0},
-		Workdir:      "/home/you/work/a1",
+		Workdir:      t.TempDir(),
 		StateDir:     t.TempDir(),
+		ShareDir:     t.TempDir(),
 		GatewayURL:   "http://198.18.7.1:18007/example",
 		GatewayToken: "stand-in-token-7f3a",
 	}
@@ -51,7 +52,7 @@ func readModels(t *testing.T, rt integration.Runtime, a integration.Agent) ([]by
 	if err := rt.Prepare(a); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(a.StateDir, "pi", "models.json"))
+	data, err := os.ReadFile(filepath.Join(a.ShareDir, "pi", "models.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +90,8 @@ func TestOptionsAreChecked(t *testing.T) {
 		{"unknown key", map[string]any{"binary": testBinary, "colour": "red"}, "colour"},
 		{"headers not a table", map[string]any{"binary": testBinary, "headers": "x"}, "headers"},
 		{"header value not a string", map[string]any{"binary": testBinary, "headers": map[string]any{"X-Team": 3}}, "X-Team"},
+		{"header value runs a command", map[string]any{"binary": testBinary, "headers": map[string]any{"X-Run": "!id"}}, "X-Run"},
+		{"header value reads a variable", map[string]any{"binary": testBinary, "headers": map[string]any{"X-Var": "$HOME"}}, "X-Var"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -176,9 +179,11 @@ func TestPrepareKeepsItsFilesPrivate(t *testing.T) {
 		t.Fatalf("Prepare: %v", err)
 	}
 	modes := map[string]os.FileMode{
-		filepath.Join(a.StateDir, "pi"):                os.ModeDir | 0o700,
-		filepath.Join(a.StateDir, "sessions"):          os.ModeDir | 0o700,
-		filepath.Join(a.StateDir, "pi", "models.json"): 0o600,
+		filepath.Join(a.ShareDir, "pi"):                os.ModeDir | 0o700,
+		filepath.Join(a.ShareDir, "pi", "models.json"): 0o600,
+		filepath.Join(a.Workdir, ".home"):              os.ModeDir | 0o700,
+		filepath.Join(a.Workdir, ".tmp"):               os.ModeDir | 0o700,
+		filepath.Join(a.Workdir, ".sessions"):          os.ModeDir | 0o700,
 	}
 	for path, want := range modes {
 		info, err := os.Stat(path)
@@ -188,6 +193,39 @@ func TestPrepareKeepsItsFilesPrivate(t *testing.T) {
 		if got := info.Mode(); got != want {
 			t.Errorf("%s: mode %v, want %v", path, got, want)
 		}
+	}
+}
+
+func TestPrepareLeavesTheStateFolderAlone(t *testing.T) {
+	rt := newTestRuntime(t, nil)
+	a := testAgent(t)
+	if err := rt.Prepare(a); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	entries, err := os.ReadDir(a.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Prepare wrote %d entries into the state folder, want none", len(entries))
+	}
+}
+
+func TestPrepareRefusesAnAgentWithoutAShareFolder(t *testing.T) {
+	rt := newTestRuntime(t, nil)
+	a := testAgent(t)
+	a.ShareDir = ""
+	if err := rt.Prepare(a); err == nil {
+		t.Error("Prepare accepted an empty ShareDir")
+	}
+}
+
+func TestPrepareRefusesAnAgentWithoutAWorkFolder(t *testing.T) {
+	rt := newTestRuntime(t, nil)
+	a := testAgent(t)
+	a.Workdir = ""
+	if err := rt.Prepare(a); err == nil {
+		t.Error("Prepare accepted an empty Workdir")
 	}
 }
 
@@ -203,6 +241,7 @@ func TestPrepareRefusesBadRoleOptions(t *testing.T) {
 		{"tool not a string", map[string]any{"tools": []any{"read", 2}}, "tools"},
 		{"tool with a comma", map[string]any{"tools": []any{"read,bash"}}, "tools"},
 		{"no tools", map[string]any{"tools": []any{}}, "tools"},
+		{"unknown key", map[string]any{"thinkng": "high"}, "thinkng"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -226,7 +265,7 @@ func TestCommandHasEveryLockdownFlag(t *testing.T) {
 	got := rt.Command(a)
 	want := []string{
 		testBinary, "--mode", "rpc", "--offline", "-ne", "-ns", "-np", "-nc", "--no-mcp", "--no-approve",
-		"--session-dir", filepath.Join(a.StateDir, "sessions"),
+		"--session-dir", filepath.Join(a.Workdir, ".sessions"),
 		"--provider", "gateway", "--model", "example-model",
 	}
 	if !slices.Equal(got, want) {
@@ -249,10 +288,10 @@ func TestEnvironment(t *testing.T) {
 	rt := newTestRuntime(t, nil)
 	a := testAgent(t)
 	want := []string{
-		"PI_CODING_AGENT_DIR=" + filepath.Join(a.StateDir, "pi"),
+		"PI_CODING_AGENT_DIR=" + filepath.Join(a.ShareDir, "pi"),
 		"PI_OFFLINE=1",
-		"HOME=/home/you/work/a1/.home",
-		"TMPDIR=/home/you/work/a1/.tmp",
+		"HOME=" + filepath.Join(a.Workdir, ".home"),
+		"TMPDIR=" + filepath.Join(a.Workdir, ".tmp"),
 		"PATH=/usr/local/bin:/usr/bin",
 		"CORRAL_GATEWAY_TOKEN=stand-in-token-7f3a",
 	}

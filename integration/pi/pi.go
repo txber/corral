@@ -63,6 +63,12 @@ func newProgram(options map[string]any) (integration.Runtime, error) {
 				if !ok {
 					return nil, fmt.Errorf("pi: option headers.%s must be a string, got %T", name, table[name])
 				}
+				// pi would run a command for a value that starts with "!" and
+				// read a variable for one that starts with "$"; this option
+				// is for literal text only.
+				if strings.HasPrefix(text, "!") || strings.HasPrefix(text, "$") {
+					return nil, fmt.Errorf("pi: option headers.%s must be literal text, not start with ! or $", name)
+				}
 				p.headers[name] = text
 			}
 		default:
@@ -82,8 +88,14 @@ func sortedKeys(m map[string]any) []string {
 }
 
 // roleOptions reads the role options pi uses: a thinking level and a list of
-// tools, each empty when not given.
+// tools, each empty when not given. Any other key is refused, so that a typo
+// is not ignored.
 func roleOptions(options map[string]any) (thinking string, tools []string, err error) {
+	for _, key := range sortedKeys(options) {
+		if key != "thinking" && key != "tools" {
+			return "", nil, fmt.Errorf("pi: unknown role option %q", key)
+		}
+	}
 	if value, ok := options["thinking"]; ok {
 		thinking, _ = value.(string)
 		if !slices.Contains(thinkingLevels, thinking) {
@@ -144,9 +156,11 @@ type (
 	}
 )
 
-// Prepare checks the role options and writes pi's configuration below the
-// agent's state folder: <StateDir>/pi/models.json with the one provider
-// "gateway", and the empty folder <StateDir>/sessions.
+// Prepare checks the role options and sets up the folders pi uses. Its
+// configuration, <ShareDir>/pi/models.json with the one provider "gateway",
+// goes where the agent can read but not change it, because it names the
+// model and its price. Home, temporary files and the session transcript go
+// below the working folder. Corral calls Prepare before Command and Env.
 func (p *program) Prepare(a integration.Agent) error {
 	thinking, _, err := roleOptions(a.Options)
 	if err != nil {
@@ -155,8 +169,17 @@ func (p *program) Prepare(a integration.Agent) error {
 	if a.Model == "" || a.GatewayURL == "" {
 		return fmt.Errorf("pi: agent %s has no model or no gateway address", a.ID)
 	}
-	configDir := filepath.Join(a.StateDir, "pi")
-	for _, dir := range []string{configDir, filepath.Join(a.StateDir, "sessions")} {
+	if a.ShareDir == "" || a.Workdir == "" {
+		return fmt.Errorf("pi: agent %s has no share folder or no working folder", a.ID)
+	}
+	configDir := filepath.Join(a.ShareDir, "pi")
+	dirs := []string{
+		configDir,
+		filepath.Join(a.Workdir, ".home"),
+		filepath.Join(a.Workdir, ".tmp"),
+		filepath.Join(a.Workdir, ".sessions"),
+	}
+	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("pi: %w", err)
 		}
@@ -198,12 +221,13 @@ func (p *program) Prepare(a integration.Agent) error {
 // Command returns pi's command line in RPC mode with everything switched off
 // that would load code, prompts or context from outside the configuration:
 // extensions, skills, prompt templates, context files, MCP and project-local
-// resources. Prepare has refused bad role options already.
+// resources. Command cannot fail: it relies on Prepare, called first, having
+// refused bad role options.
 func (p *program) Command(a integration.Agent) []string {
 	argv := []string{
 		p.binary, "--mode", "rpc", "--offline",
 		"-ne", "-ns", "-np", "-nc", "--no-mcp", "--no-approve",
-		"--session-dir", filepath.Join(a.StateDir, "sessions"),
+		"--session-dir", filepath.Join(a.Workdir, ".sessions"),
 		"--provider", "gateway", "--model", a.Model,
 	}
 	thinking, tools, _ := roleOptions(a.Options)
@@ -220,7 +244,7 @@ func (p *program) Command(a integration.Agent) []string {
 // one; in network mode "none" the sandbox sets it.
 func (p *program) Env(a integration.Agent) []string {
 	env := []string{
-		"PI_CODING_AGENT_DIR=" + filepath.Join(a.StateDir, "pi"),
+		"PI_CODING_AGENT_DIR=" + filepath.Join(a.ShareDir, "pi"),
 		"PI_OFFLINE=1",
 		"HOME=" + filepath.Join(a.Workdir, ".home"),
 		"TMPDIR=" + filepath.Join(a.Workdir, ".tmp"),

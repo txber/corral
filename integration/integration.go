@@ -79,6 +79,7 @@ type Agent struct {
 	Cost         Cost
 	Workdir      string // the only folder the agent may write
 	StateDir     string // private to the supervisor; integrations put generated files here
+	ShareDir     string // a folder the agent may read but not write; integrations put there what the agent program must read
 	Limits       Limits
 	Deny         []string // folders the agent must never read
 	Gateway      Gateway  // the model gateway this agent uses

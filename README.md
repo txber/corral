@@ -237,6 +237,12 @@ write `GET /models` for `/v1/models`. Other endpoints get 403.
   confining files and processes and `nono proxy` serving the gateway.
 - `"proxy"` is refused.
 
+corral removes the write access that nono's default profile gives every
+sandbox to `/tmp` and to terminals (`/dev/tty`, `/dev/pts`), so a program in
+the sandbox writes its temporary files below its own working folder (the
+runtime integration sets `TMPDIR` there). A tool that insists on `/tmp` or
+a terminal fails inside the sandbox.
+
 **The system must offer:**
 
 - Landlock, as `nono setup --check-only` reports it; corral is tested on a

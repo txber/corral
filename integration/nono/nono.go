@@ -87,6 +87,7 @@ const approvalTimeoutSecs = 30
 // profile is the part of nono's profile format that corral writes.
 type profile struct {
 	Extends    string             `json:"extends"`
+	Groups     *groupsSection     `json:"groups,omitempty"`
 	Linux      *linuxSection      `json:"linux,omitempty"`
 	Security   *securitySection   `json:"security,omitempty"`
 	Filesystem *filesystemSection `json:"filesystem,omitempty"`
@@ -115,9 +116,14 @@ type approvalDefaults struct {
 	Backend string `json:"backend"`
 }
 
+type groupsSection struct {
+	Exclude []string `json:"exclude"`
+}
+
 type filesystemSection struct {
-	Read []string `json:"read,omitempty"`
-	Deny []string `json:"deny,omitempty"`
+	Read  []string `json:"read,omitempty"`
+	Write []string `json:"write,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
 }
 
 type networkSection struct {
@@ -211,7 +217,20 @@ func sandboxProfile(a integration.Agent, readPaths []string) (profile, error) {
 			ApprovalBackends:    approvals,
 			ApprovalDefaults:    approvalDefaults{Backend: backendName},
 		},
-		Filesystem: &filesystemSection{Read: readPaths, Deny: a.Deny},
+		// nono's default profile lets every sandbox write /tmp, $TMPDIR,
+		// /dev/tty and /dev/pts through its group system_write_linux. /tmp
+		// is shared by all agents and lies outside the working folder, and
+		// a terminal may be the operator's own, so the profile drops the
+		// group and grants back only the devices and the standard streams.
+		Groups: &groupsSection{Exclude: []string{"system_write_linux"}},
+		Filesystem: &filesystemSection{
+			Read: readPaths,
+			Write: []string{
+				"/dev/null", "/dev/zero", "/dev/full",
+				"/dev/stdout", "/dev/stderr", "/dev/fd", "/proc/self/fd",
+			},
+			Deny: a.Deny,
+		},
 	}
 	if a.Network == "direct" {
 		return p, nil

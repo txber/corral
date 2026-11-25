@@ -131,6 +131,36 @@ func TestSandboxProfileMediatesUnixSocketsAndDeniesTheGivenFolders(t *testing.T)
 	checkField(t, profile, []string{"/usr/local/lib/tool"}, "filesystem", "read")
 }
 
+func TestSandboxProfileReplacesNonosSystemWriteGrantsWithTheStandardStreams(t *testing.T) {
+	for _, network := range []string{"none", "direct"} {
+		profile := prepared(t, sampleAgent(t, network), nil)
+		checkField(t, profile, []string{"system_write_linux"}, "groups", "exclude")
+		checkField(t, profile, []string{
+			"/dev/null", "/dev/zero", "/dev/full",
+			"/dev/stdout", "/dev/stderr", "/dev/fd", "/proc/self/fd",
+		}, "filesystem", "write")
+	}
+}
+
+func TestSandboxProfileGrantsNoSharedTemporaryFolderOrTerminal(t *testing.T) {
+	shared := []string{"/tmp", "$TMPDIR", "/dev/tty", "/dev/pts"}
+	for _, network := range []string{"none", "direct"} {
+		profile := prepared(t, sampleAgent(t, network), nil)
+		filesystem, _ := profile["filesystem"].(map[string]any)
+		for key, list := range filesystem {
+			if key == "deny" {
+				continue
+			}
+			paths, _ := list.([]any)
+			for _, p := range paths {
+				if path, _ := p.(string); slices.Contains(shared, path) {
+					t.Errorf("network %q: filesystem.%s grants %v", network, key, p)
+				}
+			}
+		}
+	}
+}
+
 func TestSandboxProfilePointsApprovalsAtItsSocket(t *testing.T) {
 	a := sampleAgent(t, "direct")
 	profile := prepared(t, a, nil)

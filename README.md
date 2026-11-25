@@ -58,6 +58,22 @@ corral version
 
 This section grows as the commands above arrive.
 
+## Configuration
+
+corral reads two TOML files; `examples/` has a complete copy of each.
+
+- `corral.toml` says where the model gateway is (`[gateway]`), which paths
+  corral uses (`[paths]`), how many agents may run at once (`max_agents`) and
+  which integration serves as sandbox, runtime and key proxy (`[sandbox]`,
+  `[runtime]`, `[key_proxy]`, each with a `use` key and that integration's own
+  options). See `examples/corral.toml`.
+- `roles.toml` has one table per kind of agent a job may start: its network
+  mode, model, limits, prices and options for the runtime. See
+  `examples/roles.toml`.
+
+A key that corral does not know is an error, and the message names it. A `~`
+at the start of a path is the home folder.
+
 ## Integrations
 
 corral does not confine or run anything itself. It drives three kinds of

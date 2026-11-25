@@ -1,0 +1,21 @@
+[offline]
+network = "none"              # the sandbox itself confines the agent to the model gateway
+model = "example-model"
+memory = "2G"
+max_processes = 256
+cost = { input = 0.0, output = 0.0, cacheRead = 0.0, cacheWrite = 0.0 }
+
+[offline.options]             # handed to the runtime integration as they are
+thinking = "medium"
+tools = ["read", "edit", "write", "bash", "grep", "find", "ls"]
+
+[worker]
+network = "direct"            # raw TCP and UDP to declared addresses, through the agent's own namespace
+model = "example-model"
+memory = "2G"
+max_processes = 256
+cost = { input = 0.0, output = 0.0, cacheRead = 0.0, cacheWrite = 0.0 }
+
+[worker.options]              # handed to the runtime integration as they are
+thinking = "medium"
+tools = ["read", "edit", "write", "bash", "grep", "find", "ls"]

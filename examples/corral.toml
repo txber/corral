@@ -1,0 +1,27 @@
+max_agents = 4
+
+[gateway]
+name = "example"
+upstream = "https://gateway.example/v1"
+endpoints = ["POST /chat/completions", "GET /models"]
+key_file = "~/.keys/example"
+
+[paths]
+state = "~/.local/state/corral"
+run = "~/.local/state/corral/run"
+work = "~/work"
+roles = "~/.config/corral/roles.toml"
+# Optional: the helper enables the network mode "direct".
+# helper = "/usr/local/bin/corral"
+
+[sandbox]
+use = "nono"
+binary = "/usr/local/bin/nono"
+
+[key_proxy]
+use = "nono"
+binary = "/usr/local/bin/nono"
+
+[runtime]
+use = "pi"
+binary = "/usr/local/lib/pi/pi"

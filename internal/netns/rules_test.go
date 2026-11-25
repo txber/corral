@@ -413,6 +413,28 @@ func TestRenderPanicsOnUncheckedTargets(t *testing.T) {
 	}
 }
 
+// A list of valid targets that makes more set elements than the bound is
+// refused whole, not rendered cut short.
+func TestRenderPanicsOnTooManySetElements(t *testing.T) {
+	// 16 ports on a /8 and 16 hosts inside it that each add a port: each
+	// host cuts the /8 into about 24 blocks, which all carry the 16 ports.
+	var targets []Target
+	for i := range 16 {
+		targets = append(targets,
+			mustTarget(t, "10.0.0.0/8:tcp:"+strconv.Itoa(1+2*i)),
+			mustTarget(t, "10."+strconv.Itoa(i)+".0.1:tcp:"+strconv.Itoa(30001+2*i)))
+	}
+	if _, _, err := setContents(targets); err == nil {
+		t.Fatal("setContents accepted the targets")
+	}
+	if !panics(func() { renderAgent("w1", 7, targets) }) {
+		t.Error("renderAgent rendered the targets")
+	}
+	if !panics(func() { renderTargets("w1", targets) }) {
+		t.Error("renderTargets rendered the targets")
+	}
+}
+
 // safeText is every character the rendered rules may hold.
 var safeText = regexp.MustCompile(`^[a-z0-9_ .,:;/{}"@=!?\-\n\t*]+$`)
 

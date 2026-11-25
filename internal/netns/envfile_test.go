@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -37,7 +38,7 @@ func TestParseEnvRefuses(t *testing.T) {
 		"a blank line":             "A=x\n\nB=y\n",
 		"a NUL byte":               "A=x\x00y\n",
 		"a key set twice":          "A=x\nA=y\n",
-		"65 lines":                 strings.Repeat("A=x\n", 64) + "B=y\n",
+		"65 lines":                 envLines(65),
 	}
 	for name, text := range tests {
 		if got, err := parseEnv([]byte(text)); err == nil {
@@ -54,6 +55,15 @@ func TestParseEnvErrorsDoNotShowValues(t *testing.T) {
 	if strings.Contains(err.Error(), "secret") {
 		t.Errorf("error %q shows a value", err)
 	}
+}
+
+// envLines returns an env file of n lines, each with its own key.
+func envLines(n int) string {
+	var b strings.Builder
+	for i := range n {
+		b.WriteString("K" + strconv.Itoa(i) + "=v\n")
+	}
+	return b.String()
 }
 
 // writeEnv writes an env file with the given mode and returns its path.

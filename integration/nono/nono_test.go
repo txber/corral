@@ -207,14 +207,14 @@ func TestModeNoneProfileRoutesOnlyTheGatewayAndNamesTheTokenVariable(t *testing.
 			},
 		},
 	}, "network", "custom_credentials")
-	// allow_domain matches the path on the gateway's host, which starts with
-	// the upstream's own path.
+	// nono checks a routed request against allow_domain with the path below
+	// the route, as it does for the route's own rules.
 	checkField(t, profile, []any{
 		map[string]any{
 			"domain": "gateway.example",
 			"endpoints": []any{
-				map[string]any{"method": "POST", "path": "/v1/chat/completions"},
-				map[string]any{"method": "GET", "path": "/v1/models"},
+				map[string]any{"method": "POST", "path": "/chat/completions"},
+				map[string]any{"method": "GET", "path": "/models"},
 			},
 		},
 	}, "network", "allow_domain")
@@ -269,8 +269,8 @@ func TestProxyProfileListsOnlyTheGateway(t *testing.T) {
 		map[string]any{
 			"domain": "gateway.example",
 			"endpoints": []any{
-				map[string]any{"method": "POST", "path": "/v1/chat/completions"},
-				map[string]any{"method": "GET", "path": "/v1/models"},
+				map[string]any{"method": "POST", "path": "/chat/completions"},
+				map[string]any{"method": "GET", "path": "/models"},
 			},
 		},
 	}, "network", "allow_domain")

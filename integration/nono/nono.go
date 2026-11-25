@@ -203,17 +203,16 @@ func gatewayNetwork(g integration.Gateway, envVar string) (networkSection, error
 	if !filepath.IsAbs(g.KeyFile) {
 		return networkSection{}, fmt.Errorf("nono: gateway key file %q is not absolute", g.KeyFile)
 	}
-	// The route's rules apply to the path below the route; allow_domain
-	// matches the full path on the gateway's host, which begins with the
-	// upstream's own path.
-	prefix := strings.TrimSuffix(upstream.Path, "/")
-	var routeRules, hostRules []endpointRule
+	// nono checks a routed request against both lists with the path below
+	// the route (/<name>/models is checked as /models), so both take the
+	// endpoints as configured. allow_domain must not be left out: without an
+	// allowlist, nono proxy forwards to any host.
+	var rules []endpointRule
 	for _, e := range g.Endpoints {
-		routeRules = append(routeRules, endpointRule{Method: e.Method, Path: e.Path})
-		hostRules = append(hostRules, endpointRule{Method: e.Method, Path: prefix + e.Path})
+		rules = append(rules, endpointRule{Method: e.Method, Path: e.Path})
 	}
 	return networkSection{
-		AllowDomain: []allowedDomain{{Domain: upstream.Hostname(), Endpoints: hostRules}},
+		AllowDomain: []allowedDomain{{Domain: upstream.Hostname(), Endpoints: rules}},
 		Credentials: []string{g.Name},
 		CustomCredentials: map[string]credentialRoute{g.Name: {
 			Upstream:         g.Upstream,
@@ -221,7 +220,7 @@ func gatewayNetwork(g integration.Gateway, envVar string) (networkSection, error
 			EnvVar:           envVar,
 			InjectHeader:     "Authorization",
 			CredentialFormat: "Bearer {}",
-			EndpointRules:    routeRules,
+			EndpointRules:    rules,
 		}},
 	}, nil
 }

@@ -548,3 +548,24 @@ func TestParseRequestRefusesWhatItCannotRead(t *testing.T) {
 		}
 	}
 }
+
+// Request bodies as nono 0.82 sends them.
+const (
+	toolFileRequest    = `{"capability_type":"capability","request_id":"seccomp-18eb49333da944fc-0","path":"/proc/sys/crypto/fips_enabled","access":"Read","reason":"Sandbox intercepted file operation (seccomp-notify)","child_pid":49407,"session_id":"a4dbc8095a4031e7"}`
+	toolNetworkRequest = `{"capability_type":"network","request_id":"4cc5a503-939c-4f6f-bf2d-b0aea3a28a53","host":"example.com","port":443,"protocol":"tcp","resolved_ips":[],"reason":null,"child_pid":0,"session_id":"a4dbc8095a4031e7"}`
+)
+
+func TestParseRequestReadsTheToolsOwnBodies(t *testing.T) {
+	got, err := parseRequest(json.RawMessage(toolFileRequest))
+	want := integration.Request{Kind: "path", ID: "seccomp-18eb49333da944fc-0", Path: "/proc/sys/crypto/fips_enabled", Access: "Read"}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("file request: parseRequest = %+v, %v; want %+v", got, err, want)
+	}
+	// A host asked about through the sandbox's proxy comes without the
+	// addresses it resolves to, so it can only be denied.
+	got, err = parseRequest(json.RawMessage(toolNetworkRequest))
+	want = integration.Request{Kind: "network", ID: "4cc5a503-939c-4f6f-bf2d-b0aea3a28a53", Host: "example.com", Port: 443, Addresses: []string{}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("network request: parseRequest = %+v, %v; want %+v", got, err, want)
+	}
+}

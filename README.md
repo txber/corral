@@ -15,6 +15,33 @@ for every one of them:
 - **Events** are the record: what an agent does, and every decision made
   about it, is written down.
 
+## What corral is for
+
+corral keeps agents inside a boundary and keeps a human at the gate. That is
+the whole job:
+
+- start and stop agent programs, each inside a sandbox;
+- confine each agent to the hosts, ports and folders it was given, enforced
+  below the agent;
+- answer an agent's permission requests from what it was given, and pass
+  everything else to a human;
+- keep model keys out of an agent's reach;
+- apply limits, and write every start, stop, grant and denial to one log.
+
+What it is not:
+
+- not an agent: it holds no model and no prompt, and it does not plan work or
+  split it up;
+- not a sandbox or a firewall of its own: it drives existing tools through
+  small interfaces, so each can be replaced;
+- not tied to a kind of work, a model provider, an agent program or a user
+  interface;
+- not a platform: one operator, one machine.
+
+A change belongs in corral if it makes the fence, the gate or the record
+better for any agent and any kind of work. What helps only one setup belongs
+in that setup's configuration or in an integration.
+
 ## Status
 
 Early. So far only `corral version` runs; the parts are added one by one.

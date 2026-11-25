@@ -16,11 +16,11 @@ roles = "~/.config/corral/roles.toml"
 
 [sandbox]
 use = "nono"
-binary = "/usr/local/bin/nono"
+binary = "/opt/nono/bin/nono"
 
 [key_proxy]
 use = "nono"
-binary = "/usr/local/bin/nono"
+binary = "/opt/nono/bin/nono"
 
 [runtime]
 use = "pi"
